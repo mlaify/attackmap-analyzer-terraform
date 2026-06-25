@@ -10,7 +10,35 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
 authors = [
-  {name = "AttackMap Contributors"}
+  {name = "Matthew Davis", email = "matthewd@matthewd.xyz"},
+  {name = "AttackMap Contributors"},
+]
+maintainers = [
+  {name = "Matthew Davis", email = "matthewd@matthewd.xyz"},
+]
+keywords = [
+  "security",
+  "static-analysis",
+  "appsec",
+  "defensive-security",
+  "attackmap",
+  "attackmap-plugin",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Security",
+  "Topic :: Software Development :: Quality Assurance",
+  "Typing :: Typed",
 ]
 dependencies = [
   "pydantic>=2.7.0",
@@ -22,7 +50,16 @@ core = [
 ]
 dev = [
   "pytest>=8.0.0",
+  "build>=1.2.0",
+  "attackmap>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mlaify/attackmap-analyzer-terraform"
+Repository = "https://github.com/mlaify/attackmap-analyzer-terraform"
+Issues = "https://github.com/mlaify/attackmap-analyzer-terraform/issues"
+Changelog = "https://github.com/mlaify/attackmap-analyzer-terraform/blob/main/CHANGELOG.md"
+"AttackMap core" = "https://github.com/mlaify/AttackMap"
 
 [project.entry-points."attackmap.analyzers"]
 terraform = "attackmap_analyzer_terraform:TerraformAnalyzer"
