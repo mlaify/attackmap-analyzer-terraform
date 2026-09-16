@@ -1,5 +1,10 @@
 # attackmap-analyzer-terraform
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 Terraform / HCL infrastructure-as-code analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 This analyzer is shaped differently from language analyzers — Terraform doesn't have routes in the application sense. Instead, it extracts:

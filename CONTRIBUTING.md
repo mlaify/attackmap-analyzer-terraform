@@ -8,7 +8,7 @@ submit changes.
 
 This project adheres to the [Code of Conduct](CODE_OF_CONDUCT.md). By
 participating, you agree to uphold it. Report unacceptable behavior to
-[matthewd@matthewd.xyz](mailto:matthewd@matthewd.xyz).
+[mlaify@mlaify.io](mailto:mlaify@mlaify.io).
 
 ## Getting started
 
@@ -69,7 +69,7 @@ evidence-text snippet, and a confidence score. See the AttackMap SDK at
 ## Reporting security issues
 
 Please do **not** open public issues for security vulnerabilities. Email
-[matthewd@matthewd.xyz](mailto:matthewd@matthewd.xyz) — see
+[mlaify@mlaify.io](mailto:mlaify@mlaify.io) — see
 [SECURITY.md](SECURITY.md) for the full disclosure policy.
 
 ## License
