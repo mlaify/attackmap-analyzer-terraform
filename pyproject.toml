@@ -46,12 +46,12 @@ dependencies = [
 
 [project.optional-dependencies]
 core = [
-  "attackmap>=0.1.0",
+  "attackmap @ git+https://github.com/mlaify/AttackMap.git",
 ]
 dev = [
   "pytest>=8.0.0",
   "build>=1.2.0",
-  "attackmap>=0.1.0",
+  "attackmap @ git+https://github.com/mlaify/AttackMap.git",
 ]
 
 [project.urls]

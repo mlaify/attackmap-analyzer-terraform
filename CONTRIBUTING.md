@@ -26,7 +26,7 @@ To exercise this analyzer against the core AttackMap CLI locally, also install
 the core package:
 
 ```bash
-pip install attackmap
+pip install "attackmap @ git+https://github.com/mlaify/AttackMap.git"
 # or, for editable dev against a sibling checkout:
 # pip install -e ../AttackMap
 ```
