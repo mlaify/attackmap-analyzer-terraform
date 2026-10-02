@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -512,3 +513,52 @@ def test_full_aws_payment_stack_signal_set(tmp_path: Path) -> None:
     assert any(d.kind == "postgresql" for d in result.databases)
     assert any((r.path, r.method) == ("/charges", "POST") for r in result.routes)
     assert any(h.hint == "iam_wildcard_action:broad" for h in result.auth_hints)
+
+
+# ---------- Repo walking (AttackMap#253) ----------
+
+_WALK_FIXTURE = (
+    'provider "aws" {\n'
+    '  region = "us-east-1"\n'
+    '}\n'
+    '\n'
+    'resource "aws_secretsmanager_secret" "stripe" {\n'
+    '  name = "stripe-secret-key"\n'
+    '}\n'
+)
+
+
+@pytest.mark.parametrize("parents", [("build", "out"), ("vendor", ".terraform")])
+def test_repo_under_skip_dir_named_parents_is_analyzed(tmp_path: Path, parents: tuple[str, ...]) -> None:
+    """A checkout under /.../build/out/... must not be skipped (absolute-path bug)."""
+    repo = tmp_path.joinpath(*parents) / "repo"
+    (repo / "infra").mkdir(parents=True)
+    (repo / "infra" / "main.tf").write_text(_WALK_FIXTURE, encoding="utf-8")
+    analyzer = TerraformAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned == 1
+    assert any(f.hint == "terraform-aws" for f in result.framework_hints)
+    assert any(s.name == "secretsmanager:stripe" and s.file == "infra/main.tf" for s in result.secret_hints)
+
+
+def test_tf_json_is_still_walked(tmp_path: Path) -> None:
+    (tmp_path / "main.tf.json").write_text('{"provider": {"aws": {}}}\n', encoding="utf-8")
+    (tmp_path / "package.json").write_text("{}\n", encoding="utf-8")
+    assert TerraformAnalyzer().detect(tmp_path) is True
+    assert TerraformAnalyzer().analyze(tmp_path).files_scanned == 1
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_file_outside_repo_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secrets.tf").write_text(_WALK_FIXTURE, encoding="utf-8")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "main.tf").write_text('variable "region" {}\n', encoding="utf-8")
+    (repo / "secrets.tf").symlink_to(outside / "secrets.tf")
+    result = TerraformAnalyzer().analyze(repo)
+    assert result.files_scanned == 1
+    assert result.secret_hints == []
+    assert result.framework_hints == []

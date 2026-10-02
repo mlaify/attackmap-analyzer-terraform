@@ -43,7 +43,7 @@ attackmap analyze /path/to/terraform/repo --module terraform
 
 ## Detection
 
-`detect()` returns true when any `.tf`, `.tf.json`, or `.tfvars` file is present in the tree, ignoring `.terraform/`, `.git/`, `node_modules/`, and `vendor/`.
+`detect()` returns true when any `.tf`, `.tf.json`, or `.tfvars` file is present in the tree, ignoring `.terraform/` and AttackMap's shared skip list (`.git/`, `node_modules/`, `vendor/`, `build/`, `dist/`, `out/`, `target/`, ...). Skip directories are matched only *inside* the repo, so a checkout under e.g. `/build/...` is still scanned. Files are walked with `attackmap.sdk.iter_repo_files`, which does not follow symlinks out of the repo.
 
 ## HCL block parsing
 

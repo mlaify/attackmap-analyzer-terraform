@@ -29,6 +29,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -43,7 +45,13 @@ from .contracts import (
 )
 
 CODE_SUFFIXES = {".tf", ".tf.json", ".tfvars"}
-SKIP_DIRS = {".terraform", ".git", "node_modules", "vendor"}
+# Terraform's provider/module cache on top of the shared skip list (which
+# already covers .git/, node_modules/, vendor/, ...). Matched against directory
+# names *inside* the repo only.
+SKIP_DIRS = DEFAULT_SKIP_DIRS | {".terraform"}
+# ``.tf.json`` can't be expressed as a single suffix, so walk ``.json`` too and
+# narrow with ``_is_terraform_file``.
+_WALK_SUFFIXES = {".tf", ".tfvars", ".json"}
 _SNIPPET_MAX_CHARS = 160
 
 # ---------- Patterns ----------
@@ -73,13 +81,15 @@ PROVIDER_BLOCK_PATTERN = re.compile(
 _ATTR_RE = re.compile(r'^\s*(\w+)\s*=\s*(.+?)\s*$', re.MULTILINE)
 
 
-def _line_of(content: str, offset: int) -> int:
-    if offset <= 0:
-        return 1
-    return content.count("\n", 0, offset) + 1
+def _is_terraform_file(path: Path) -> bool:
+    return path.suffix == ".tf" or path.name.endswith(".tf.json") or path.suffix == ".tfvars"
 
 
 def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CHARS) -> str:
+    # Kept local rather than ``attackmap.sdk.line_snippet(content, line_of(...))``:
+    # the SDK helper indexes ``str.splitlines()``, which also breaks on form
+    # feeds and lone ``\r``, so its line numbering can disagree with
+    # ``line_of`` (which counts ``\n`` only).
     line_start = content.rfind("\n", 0, offset) + 1
     line_end = content.find("\n", offset)
     if line_end == -1:
@@ -213,12 +223,8 @@ class TerraformAnalyzer:
         root = Path(repo_path).resolve()
         if not root.exists() or not root.is_dir():
             return False
-        for path in root.rglob("*"):
-            if any(part in SKIP_DIRS for part in path.parts):
-                continue
-            if not path.is_file():
-                continue
-            if path.suffix == ".tf" or path.name.endswith(".tf.json") or path.suffix == ".tfvars":
+        for path in iter_repo_files(root, suffixes=_WALK_SUFFIXES, skip_dirs=SKIP_DIRS):
+            if _is_terraform_file(path):
                 return True
         return False
 
@@ -228,24 +234,18 @@ class TerraformAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        for file_path in root.rglob("*"):
-            if not file_path.is_file():
+        for file_path in iter_repo_files(root, suffixes=_WALK_SUFFIXES, skip_dirs=SKIP_DIRS):
+            if not _is_terraform_file(file_path):
                 continue
-            if any(part in SKIP_DIRS for part in file_path.parts):
-                continue
-            if not (file_path.suffix == ".tf" or file_path.name.endswith(".tf.json") or file_path.suffix == ".tfvars"):
+            content = read_source(file_path)
+            if content is None:
                 continue
 
             result.files_scanned += 1
             if "hcl" not in result.languages:
                 result.languages.append("hcl")
 
-            try:
-                content = file_path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_providers(content, relative, result)
             self._extract_resources(content, relative, result)
             self._extract_variables(content, relative, result)
@@ -263,7 +263,7 @@ class TerraformAnalyzer:
             label = _PROVIDER_LABEL.get(provider, f"terraform-{provider}")
             self._append_unique_framework(
                 result, label, relative,
-                _line_of(content, match.start()),
+                line_of(content, match.start()),
                 _line_snippet(content, match.start()),
             )
 
@@ -271,14 +271,14 @@ class TerraformAnalyzer:
         for match in RESOURCE_BLOCK_PATTERN.finditer(content):
             resource_type, resource_name = match.group(1), match.group(2)
             body, _ = _block_body(content, match.end())
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             self._dispatch_resource(resource_type, resource_name, body, relative, line, content, match.start(), result)
 
     def _extract_variables(self, content: str, relative: str, result: ScanResult) -> None:
         for match in VARIABLE_BLOCK_PATTERN.finditer(content):
             var_name = match.group(1)
             body, _ = _block_body(content, match.end())
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             sensitive = (_extract_attr(body, "sensitive") or "").lower() == "true"
             if sensitive or _looks_secret_shaped(var_name):
                 self._append_unique_secret(
@@ -295,7 +295,7 @@ class TerraformAnalyzer:
         # data "aws_secretsmanager_secret" "x" { ... } — surface secret references via data.
         for match in DATA_BLOCK_PATTERN.finditer(content):
             data_type, data_name = match.group(1), match.group(2)
-            line = _line_of(content, match.start())
+            line = line_of(content, match.start())
             if data_type in {"aws_secretsmanager_secret", "aws_secretsmanager_secret_version", "aws_ssm_parameter"}:
                 self._append_unique_secret(
                     result, f"data:{data_type}:{data_name}", relative, line,
