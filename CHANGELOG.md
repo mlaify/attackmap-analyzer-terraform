@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Walk and read the repo with the shared `attackmap.sdk` helpers (`iter_repo_files`, `read_source`, `rel`, `line_of`) instead of a local `rglob` + `SKIP_DIRS` walk (mlaify/AttackMap#253).
+- The skip list is now AttackMap's shared `DEFAULT_SKIP_DIRS` plus `.terraform/`, so `.tf` files under in-repo `build/`, `dist/`, `out/`, `target/`, `venv/` etc. directories are no longer scanned.
+
+### Fixed
+
+- A repo checked out under a directory named like a skip dir (e.g. `.../vendor/...`) was silently not analyzed, because skip dirs were matched against absolute path parts.
+- Symlinked files pointing outside the repo are no longer followed and analyzed.
+- cp1252/latin-1 encoded files are analyzed instead of silently dropped, and an unreadable file no longer raises out of `analyze()`.
+- `files_scanned` no longer counts files that could not be read.
+
 ## [0.1.0] - 2026-06-04
 
 ### Added
