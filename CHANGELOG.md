@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `data "aws_iam_policy_document"` `statement { }` blocks are checked for wildcard `actions`, `resources` and `principals` (#3).
+- `aws_iam_role` trust (`assume_role_policy`) and inline policies, and `aws_iam_group_policy`, are checked; Allow statements with `Principal "*"` and no `Condition` emit `iam_wildcard_principal:<name>` (#3).
+- `Resource "*"` now emits `iam_wildcard_resource:<name>` (confidence 0.5), as the docs already claimed (#3).
+- Inline `acl = "public-read"` on `aws_s3_bucket` (AWS provider <= v3) emits `s3_public_acl:<name>`; public bucket policies (inline `policy` or `aws_s3_bucket_policy`) emit `s3_public_policy:<name>` (#3).
+- `.tfvars` secret-shaped string literals (`db_password = "..."`) emit `SecretHint(kind="hardcoded")`, with the value redacted from evidence (#3).
+- `.tf.json` files are parsed as JSON and analyzed identically to `.tf`, with `file:line` pointing into the JSON source (#3).
+
 ### Changed
 
 - Walk and read the repo with the shared `attackmap.sdk` helpers (`iter_repo_files`, `read_source`, `rel`, `line_of`) instead of a local `rglob` + `SKIP_DIRS` walk (mlaify/AttackMap#253).
@@ -14,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `aws_security_group` with an open CIDR only in `egress` (the default) was reported as `sg_open_ingress`; only `ingress` blocks (including `dynamic "ingress"` and `ingress = [{...}]`) are checked now. Egress `aws_security_group_rule`s, outbound Azure NSG rules and `EGRESS` GCP firewalls are no longer reported as open (#3).
+- IAM policy checks are statement-aware: `Deny` statements are ignored, keys are matched case-insensitively, and the old check that matched `Action = "*"` anywhere in the body is gone (#3).
+- `_extract_attr` only reads a block's own top-level attributes, so e.g. a nested `type = ...` no longer shadows the resource's `type` (#3).
 - A repo checked out under a directory named like a skip dir (e.g. `.../vendor/...`) was silently not analyzed, because skip dirs were matched against absolute path parts.
 - Symlinked files pointing outside the repo are no longer followed and analyzed.
 - cp1252/latin-1 encoded files are analyzed instead of silently dropped, and an unreadable file no longer raises out of `analyze()`.
