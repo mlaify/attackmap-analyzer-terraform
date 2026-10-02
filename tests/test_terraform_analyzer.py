@@ -1090,3 +1090,147 @@ def test_tf_json_invalid_json_is_skipped(tmp_path: Path) -> None:
     result = TerraformAnalyzer().analyze(tmp_path)
     assert result.files_scanned == 1
     assert _signals(result) == set()
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+_REST_API = (
+    'resource "aws_api_gateway_rest_api" "api" {\n'
+    '  name = "orders"\n'
+    "}\n\n"
+    'resource "aws_api_gateway_resource" "orders" {\n'
+    "  rest_api_id = aws_api_gateway_rest_api.api.id\n"
+    "  parent_id   = aws_api_gateway_rest_api.api.root_resource_id\n"
+    '  path_part   = "orders"\n'
+    "}\n\n"
+    'resource "aws_api_gateway_resource" "order" {\n'
+    "  rest_api_id = aws_api_gateway_rest_api.api.id\n"
+    "  parent_id   = aws_api_gateway_resource.orders.id\n"
+    '  path_part   = "{id}"\n'
+    "}\n"
+)
+_REST_METHODS = (
+    'resource "aws_api_gateway_method" "create_order" {\n'
+    "  rest_api_id   = aws_api_gateway_rest_api.api.id\n"
+    "  resource_id   = aws_api_gateway_resource.orders.id\n"
+    '  http_method   = "POST"\n'
+    '  authorization = "COGNITO_USER_POOLS"\n'
+    "  authorizer_id = aws_api_gateway_authorizer.cognito.id\n"
+    "}\n\n"
+    'resource "aws_api_gateway_method" "cancel_order" {\n'
+    "  rest_api_id   = aws_api_gateway_rest_api.api.id\n"
+    "  resource_id   = aws_api_gateway_resource.order.id\n"
+    '  http_method   = "DELETE"\n'
+    '  authorization = "NONE"\n'
+    "}\n\n"
+    'resource "aws_api_gateway_method" "update_order" {\n'
+    "  rest_api_id      = aws_api_gateway_rest_api.api.id\n"
+    "  resource_id      = aws_api_gateway_resource.order.id\n"
+    '  http_method      = "PUT"\n'
+    '  authorization    = "NONE"\n'
+    "  api_key_required = true\n"
+    "}\n"
+)
+
+
+def _routes_by_key(result) -> dict:
+    return {f"{r.method} {r.path}": r for r in result.routes}
+
+
+def test_rest_api_methods_become_routes_with_declared_auth(tmp_path: Path) -> None:
+    # Resources and methods in different files: paths resolve after the walk.
+    (tmp_path / "api.tf").write_text(_REST_API, encoding="utf-8")
+    (tmp_path / "methods.tf").write_text(_REST_METHODS, encoding="utf-8")
+    routes = _routes_by_key(TerraformAnalyzer().analyze(tmp_path))
+    create = routes["POST /orders"]
+    assert create.auth == "required"
+    assert create.guards == ["COGNITO_USER_POOLS (aws_api_gateway_authorizer.cognito.id)"]
+    assert create.guard_evidence == (
+        'authorization = "COGNITO_USER_POOLS"; authorizer_id = aws_api_gateway_authorizer.cognito.id'
+    )
+    assert create.file == "methods.tf" and create.line == 1
+
+
+def test_rest_api_method_with_authorization_none_is_anonymous(tmp_path: Path) -> None:
+    (tmp_path / "api.tf").write_text(_REST_API + "\n" + _REST_METHODS, encoding="utf-8")
+    routes = _routes_by_key(TerraformAnalyzer().analyze(tmp_path))
+    # A NONE method nested under the guarded /orders resource: API Gateway
+    # authorizes per method, so the parent's authorizer doesn't carry over.
+    cancel = routes["DELETE /orders/{id}"]
+    assert cancel.auth == "anonymous"
+    assert cancel.guards == []
+    assert cancel.guard_evidence == 'authorization = "NONE"'
+    # NONE plus a required API key still rejects callers without the key.
+    update = routes["PUT /orders/{id}"]
+    assert update.auth == "required"
+    assert update.guards == ["api_key_required"]
+
+
+def test_http_api_route_authorization_type(tmp_path: Path) -> None:
+    (tmp_path / "http.tf").write_text(
+        'resource "aws_apigatewayv2_route" "create_user" {\n'
+        "  api_id             = aws_apigatewayv2_api.api.id\n"
+        '  route_key          = "POST /users"\n'
+        '  authorization_type = "JWT"\n'
+        "  authorizer_id      = aws_apigatewayv2_authorizer.jwt.id\n"
+        "}\n\n"
+        'resource "aws_apigatewayv2_route" "signup" {\n'
+        "  api_id             = aws_apigatewayv2_api.api.id\n"
+        '  route_key          = "POST /signup"\n'
+        '  authorization_type = "NONE"\n'
+        "}\n\n"
+        'resource "aws_apigatewayv2_route" "computed" {\n'
+        "  api_id             = aws_apigatewayv2_api.api.id\n"
+        '  route_key          = "PUT /settings"\n'
+        "  authorization_type = var.settings_auth\n"
+        "}\n\n"
+        'resource "aws_apigatewayv2_route" "implicit" {\n'
+        "  api_id    = aws_apigatewayv2_api.api.id\n"
+        '  route_key = "DELETE /cache"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    routes = _routes_by_key(TerraformAnalyzer().analyze(tmp_path))
+    assert routes["POST /users"].auth == "required"
+    assert routes["POST /users"].guards == ["JWT (aws_apigatewayv2_authorizer.jwt.id)"]
+    assert routes["POST /signup"].auth == "anonymous"
+    assert routes["POST /signup"].guard_evidence == 'authorization_type = "NONE"'
+    # Computed or omitted: not declared either way.
+    assert routes["PUT /settings"].auth == "unknown"
+    assert routes["DELETE /cache"].auth == "unknown"
+    assert routes["DELETE /cache"].guard_evidence is None
+
+
+def test_lambda_function_url_is_a_route_with_its_auth(tmp_path: Path) -> None:
+    (tmp_path / "lambda.tf").write_text(
+        'resource "aws_lambda_function_url" "open" {\n'
+        "  function_name      = aws_lambda_function.fn.function_name\n"
+        '  authorization_type = "NONE"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "iam.tf").write_text(
+        'resource "aws_lambda_function_url" "iam" {\n'
+        "  function_name      = aws_lambda_function.fn.function_name\n"
+        '  authorization_type = "AWS_IAM"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    routes = {(r.file, r.method, r.path): r for r in TerraformAnalyzer().analyze(tmp_path).routes}
+    assert routes[("lambda.tf", "ANY", "/")].auth == "anonymous"
+    assert routes[("iam.tf", "ANY", "/")].auth == "required"
+    assert routes[("iam.tf", "ANY", "/")].guards == ["AWS_IAM"]
+
+
+def test_rest_api_method_on_unresolvable_resource_is_not_a_route(tmp_path: Path) -> None:
+    (tmp_path / "m.tf").write_text(
+        'resource "aws_api_gateway_method" "m" {\n'
+        "  resource_id   = module.api.resource_id\n"
+        '  http_method   = "POST"\n'
+        '  authorization = "NONE"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    result = TerraformAnalyzer().analyze(tmp_path)
+    assert result.routes == []
+    assert "apigw_open_method:POST:m" in {e.hint for e in result.entrypoint_hints}
