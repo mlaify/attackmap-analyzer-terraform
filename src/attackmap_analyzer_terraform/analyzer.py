@@ -3,20 +3,26 @@
 This analyzer is shaped differently from language analyzers — Terraform doesn't
 have routes in the application sense. Instead, the value is in:
 
-- **Public ingress** — security groups / NACLs / Lambda function URLs / API
-  Gateway methods with no auth → `entrypoint_hints`
+- **Public ingress** — security groups (open CIDRs in `ingress` only; open
+  egress is ignored) / Lambda function URLs / API Gateway methods with no
+  auth / public S3 ACLs and bucket policies → `entrypoint_hints`
 - **Asset inventory** — S3 buckets, RDS, DynamoDB, Cognito user pools, KMS keys
   → `service_hints` and `database_hints`
 - **Secrets** — `aws_secretsmanager_secret`, `aws_ssm_parameter` (SecureString),
-  `variable` blocks marked `sensitive = true` or with secret-shaped names
+  `variable` blocks marked `sensitive = true` or with secret-shaped names,
+  and secret-shaped string literals in `.tfvars` (`kind="hardcoded"`)
   → `secret_hints`
-- **IAM blast radius** — wildcards in policy actions (`Action: *`) → `auth_hints`
-  with low confidence (broad permissions)
+- **IAM blast radius** — `Action "*"`, `Resource "*"` and Allow-`Principal "*"`
+  in `aws_iam_*` policies, role trust policies and `aws_iam_policy_document`
+  data sources → `auth_hints`
 - **Database engines** — `aws_db_instance.engine = "postgres"` → `database_hints`
   with the engine as the kind
 
 All emissions populate Signal v2 fields (line numbers, evidence snippets) so
 downstream insights can cite `infra/main.tf:NN`.
+
+`.tf.json` files are parsed with `json` and each block is rendered back to HCL
+and sent through the same handlers, so both syntaxes yield the same signals.
 
 HCL parsing uses brace-depth counting on top of regex. This is approximate but
 sufficient for the resource-level introspection the analyzer needs. Variable
@@ -26,6 +32,7 @@ attribute values are what we extract.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -130,19 +137,168 @@ def _block_body(content: str, body_start: int) -> tuple[str, int]:
     return content[body_start:i], i
 
 
+def _scan_text(text: str) -> tuple[list[int], list[bool]]:
+    """Per-character brace depth and string mask for ``text``.
+
+    ``depths[i]`` is the ``{ }`` nesting depth of the code around character
+    ``i`` (an opening ``{`` and its matching ``}`` both carry the outer depth);
+    ``in_string[i]`` is True for characters of a ``"..."`` literal, quotes
+    included. Braces inside strings don't count."""
+    depths = [0] * len(text)
+    in_string = [False] * len(text)
+    depth = 0
+    inside = False
+    escape = False
+    for i, ch in enumerate(text):
+        if inside:
+            in_string[i] = True
+            depths[i] = depth
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                inside = False
+            continue
+        if ch == '"':
+            inside = True
+            in_string[i] = True
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+        depths[i] = depth
+        if ch == "{":
+            depth += 1
+    return depths, in_string
+
+
+def _top_level(body: str) -> str:
+    """``body`` with the contents of every nested ``{ ... }`` removed (the
+    braces themselves are kept), so attribute lookups only see the block's own
+    attributes and not those of nested blocks or object values."""
+    depths, _ = _scan_text(body)
+    return "".join(ch for ch, d in zip(body, depths) if d == 0)
+
+
+def _at_top(depths: list[int], in_string: list[bool], text: str, i: int) -> bool:
+    """True if a token starting at ``i`` is top-level code (or the opening
+    quote of a top-level string key)."""
+    if depths[i] != 0:
+        return False
+    if not in_string[i]:
+        return True
+    return text[i] == '"' and (i == 0 or not in_string[i - 1])
+
+
 def _extract_attr(body: str, name: str) -> str | None:
     """Return the value of a top-level attribute `name = ...` in a block body
     (does not descend into nested blocks). Strips matching quotes."""
+    top = _top_level(body)
     pattern = re.compile(rf'^\s*{re.escape(name)}\s*=\s*"([^"]*)"\s*$', re.MULTILINE)
-    match = pattern.search(body)
+    match = pattern.search(top)
     if match:
         return match.group(1)
     # Try unquoted form (booleans, references, numbers, lists)
     raw_pattern = re.compile(rf'^\s*{re.escape(name)}\s*=\s*([^\n]+?)\s*$', re.MULTILINE)
-    match = raw_pattern.search(body)
+    match = raw_pattern.search(top)
     if match:
         return match.group(1).strip()
     return None
+
+
+def _sub_blocks(body: str, name: str) -> list[str]:
+    """Bodies of the nested blocks called ``name`` directly inside ``body``.
+
+    Covers ``name { ... }``, ``dynamic "name" { ... }`` and the
+    attributes-as-blocks form ``name = [{ ... }, { ... }]``. Blocks nested
+    deeper than one level are not returned."""
+    depths, in_string = _scan_text(body)
+    header = re.compile(rf'(?:(?<![\w.]){re.escape(name)}|\bdynamic\s+"{re.escape(name)}")\s*(\{{|=\s*\[)')
+    blocks: list[str] = []
+    for match in header.finditer(body):
+        if not _at_top(depths, in_string, body, match.start()):
+            continue
+        if match.group(1) == "{":
+            inner, _ = _block_body(body, match.end())
+            blocks.append(inner)
+            continue
+        i = match.end()
+        while i < len(body):
+            ch = body[i]
+            if depths[i] == 0 and not in_string[i] and ch == "]":
+                break
+            if depths[i] == 0 and not in_string[i] and ch == "{":
+                inner, end = _block_body(body, i + 1)
+                blocks.append(inner)
+                i = end + 1
+                continue
+            i += 1
+    return blocks
+
+
+def _attr_value(text: str, key: str) -> str | None:
+    """Raw value of ``key = value`` / ``"key": value`` at the top level of
+    ``text`` (case-insensitive key). Returns the string literal, the whole
+    ``[...]`` list or the whole ``{...}`` object, or None when absent."""
+    depths, in_string = _scan_text(text)
+    pattern = re.compile(rf'(?<![\w.])"?{re.escape(key)}"?\s*[:=](?!=)\s*', re.IGNORECASE)
+    for match in pattern.finditer(text):
+        if not _at_top(depths, in_string, text, match.start()):
+            continue
+        i = match.end()
+        if i >= len(text):
+            return None
+        ch = text[i]
+        if ch == '"':
+            end = i + 1
+            while end < len(text) and not (text[end] == '"' and text[end - 1] != "\\"):
+                end += 1
+            return text[i : end + 1]
+        if ch == "{":
+            inner, _ = _block_body(text, i + 1)
+            return "{" + inner + "}"
+        heredoc = _HEREDOC_RE.match(text, i)
+        if heredoc:
+            marker = heredoc.group(1)
+            terminator = re.compile(rf"^[ \t]*{re.escape(marker)}[ \t]*$", re.MULTILINE)
+            end = terminator.search(text, heredoc.end())
+            return text[i : end.end() if end else len(text)]
+        # Lists, function calls (`jsonencode({...})`), references: read up to
+        # the end of the line or a top-level `,` (one-line objects), extended
+        # across balanced ( [ { and strings.
+        level = 0
+        quoted = False
+        end = i
+        while end < len(text):
+            c = text[end]
+            if quoted:
+                if c == "\\":
+                    end += 2
+                    continue
+                if c == '"':
+                    quoted = False
+            elif c == '"':
+                quoted = True
+            elif c in "([{":
+                level += 1
+            elif c in ")]}":
+                level -= 1
+                if level < 0:
+                    break
+            elif c in "\n," and level == 0:
+                break
+            end += 1
+        return text[i:end].strip()
+    return None
+
+
+_HEREDOC_RE = re.compile(r"<<-?\s*([A-Za-z_]\w*)[ \t]*\n")
+_WILDCARD_RE = re.compile(r'"\*"')
+
+
+def _has_wildcard(value: str | None) -> bool:
+    """True if ``value`` (a string literal, list or object) contains the bare
+    ``"*"`` element. ``"s3:*"`` and similar service wildcards don't count."""
+    return value is not None and _WILDCARD_RE.search(value) is not None
 
 
 def _has_open_cidr(body: str) -> bool:
@@ -151,17 +307,79 @@ def _has_open_cidr(body: str) -> bool:
     return '"0.0.0.0/0"' in body or '"::/0"' in body
 
 
-def _has_iam_wildcard_action(body: str) -> bool:
-    """Detect IAM policy bodies with wildcard `Action` or `Resource`."""
-    if '"Action": "*"' in body or '"Action":"*"' in body:
-        return True
-    if re.search(r'"Action"\s*:\s*\[\s*"\*"\s*\]', body):
-        return True
-    if re.search(r'Action\s*=\s*\[\s*"\*"\s*\]', body):
-        return True
-    if re.search(r'Action\s*=\s*"\*"', body):
-        return True
-    return False
+def _has_open_ingress(sg_body: str) -> bool:
+    """True if any ``ingress`` sub-block of an ``aws_security_group`` allows
+    an open CIDR. Open ``egress`` (the near-universal default) is ignored."""
+    return any(_has_open_cidr(block) for block in _sub_blocks(sg_body, "ingress"))
+
+
+_STATEMENT_KEY_RE = re.compile(
+    r'(?<![\w.])"?(?:Effect|Action|NotAction|Principal|NotPrincipal)"?\s*[:=](?!=)', re.IGNORECASE,
+)
+
+
+def _json_policy_statements(text: str) -> list[str]:
+    """Bodies of IAM policy statement objects found anywhere in ``text``
+    (``jsonencode({...})``, heredoc JSON or a JSON string rendered as a
+    heredoc). A statement is any ``{ ... }`` whose own keys include Effect,
+    Action, NotAction, Principal or NotPrincipal (case-insensitive)."""
+    _, in_string = _scan_text(text)
+    statements: list[str] = []
+    for i, ch in enumerate(text):
+        if ch != "{" or in_string[i]:
+            continue
+        inner, _ = _block_body(text, i + 1)
+        if _STATEMENT_KEY_RE.search(_top_level(inner)):
+            statements.append(inner)
+    return statements
+
+
+def _statement_is_deny(effect: str | None) -> bool:
+    return (effect or "").strip().strip('"').lower() == "deny"
+
+
+class _PolicyFindings:
+    __slots__ = ("wildcard_action", "wildcard_resource", "public_principal")
+
+    def __init__(self) -> None:
+        self.wildcard_action = False
+        self.wildcard_resource = False
+        # Allow + Principal "*" with no Condition: anyone can use it.
+        self.public_principal = False
+
+
+def _scan_json_policies(text: str) -> _PolicyFindings:
+    findings = _PolicyFindings()
+    for statement in _json_policy_statements(text):
+        if _statement_is_deny(_attr_value(statement, "Effect")):
+            continue
+        if _has_wildcard(_attr_value(statement, "Action")):
+            findings.wildcard_action = True
+        if _has_wildcard(_attr_value(statement, "Resource")):
+            findings.wildcard_resource = True
+        if _has_wildcard(_attr_value(statement, "Principal")) and _attr_value(statement, "Condition") is None:
+            findings.public_principal = True
+    return findings
+
+
+def _scan_policy_document(body: str) -> _PolicyFindings:
+    """``data "aws_iam_policy_document"``: HCL ``statement { ... }`` blocks."""
+    findings = _PolicyFindings()
+    for statement in _sub_blocks(body, "statement"):
+        if _statement_is_deny(_extract_attr(statement, "effect")):
+            continue
+        top = _top_level(statement)
+        if _has_wildcard(_attr_value(top, "actions")):
+            findings.wildcard_action = True
+        if _has_wildcard(_attr_value(top, "resources")):
+            findings.wildcard_resource = True
+        if not _sub_blocks(statement, "condition"):
+            for principals in _sub_blocks(statement, "principals"):
+                if _has_wildcard(_attr_value(principals, "identifiers")) or _has_wildcard(
+                    _attr_value(principals, "type")
+                ):
+                    findings.public_principal = True
+    return findings
 
 
 # Provider/framework labels — used both as framework_hints and to gate cloud-specific extractors.
@@ -197,6 +415,105 @@ _SECRET_KEYWORDS = ("secret", "token", "key", "password", "pass", "pwd", "creden
 def _looks_secret_shaped(name: str) -> bool:
     lowered = name.lower()
     return any(kw in lowered for kw in _SECRET_KEYWORDS)
+
+
+_PUBLIC_S3_ACLS = {"public-read", "public-read-write"}
+_IAM_POLICY_RESOURCES = {
+    "aws_iam_policy",
+    "aws_iam_role_policy",
+    "aws_iam_user_policy",
+    "aws_iam_group_policy",
+    "aws_iam_role",
+}
+
+# `key = "literal"` in a .tfvars file (string values only; numbers/bools are
+# never credentials and references aren't allowed in tfvars).
+_TFVARS_ASSIGN_RE = re.compile(r'^[ \t]*([A-Za-z_][\w-]*)[ \t]*=[ \t]*"((?:[^"\\\n]|\\.)*)"', re.MULTILINE)
+# Secret-shaped names whose value is an identifier/locator, not a credential
+# (`kms_key_id`, `ssh_key_name`, `secret_arn`, `token_ttl`, ...).
+_NON_SECRET_LAST_TOKENS = {
+    "name", "names", "id", "ids", "arn", "arns", "path", "file", "type", "length",
+    "size", "version", "count", "enabled", "enable", "days", "period", "ttl",
+    "alias", "prefix", "suffix", "region", "rotation", "policy", "usage", "spec",
+}
+
+
+def _tfvars_key_is_secret(key: str) -> bool:
+    if not _looks_secret_shaped(key):
+        return False
+    last = re.split(r"[_-]", key.lower())[-1]
+    return last not in _NON_SECRET_LAST_TOKENS
+
+
+def _looks_like_reference(value: str) -> bool:
+    return value.startswith(("${", "arn:"))
+
+
+def _json_objects(value: object) -> list[dict]:
+    """Terraform JSON lets any block level be an object or a list of objects."""
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _json_scalar_to_hcl(value: object) -> str:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if "\n" in value or (stripped.startswith(("{", "${")) and '"' in value):
+            # Embedded policy JSON / `${jsonencode(...)}`: emit as a heredoc so
+            # the policy scanners see its structure, not an escaped string.
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                text = value
+            else:
+                text = json.dumps(parsed, indent=2)
+            return f"<<EOT\n{text}\nEOT"
+        return json.dumps(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    return json.dumps(value)
+
+
+def _json_to_hcl(obj: dict, indent: int = 0) -> str:
+    """Render a Terraform JSON block body as HCL. Object values and lists of
+    objects become nested blocks (how Terraform JSON spells `ingress { }`,
+    `statement { }`, ...); everything else is an attribute."""
+    pad = "  " * indent
+    lines: list[str] = []
+    for key, value in obj.items():
+        blocks = _json_objects(value)
+        if blocks and (isinstance(value, dict) or len(blocks) == len(value)):
+            for block in blocks:
+                lines.append(f"{pad}{key} {{")
+                lines.append(_json_to_hcl(block, indent + 1))
+                lines.append(f"{pad}}}")
+        else:
+            lines.append(f"{pad}{key} = {_json_scalar_to_hcl(value)}")
+    return "\n".join(lines)
+
+
+class _JsonLocator:
+    """Find the source offset of a JSON object key, scanning forward so that
+    repeated names (same resource name under two types) resolve in order."""
+
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.pos = 0
+
+    def find(self, key: str, *, from_start: bool = False) -> int:
+        if from_start:
+            self.pos = 0
+        pattern = re.compile(r'"' + re.escape(key) + r'"\s*:')
+        match = pattern.search(self.content, self.pos) or pattern.search(self.content)
+        if match is None:
+            return self.pos
+        self.pos = match.end()
+        return match.start()
 
 
 class TerraformAnalyzer:
@@ -246,6 +563,11 @@ class TerraformAnalyzer:
                 result.languages.append("hcl")
 
             relative = rel(file_path, root)
+            if file_path.name.endswith(".tf.json"):
+                self._analyze_tf_json(content, relative, result)
+                continue
+            if file_path.suffix == ".tfvars":
+                self._extract_tfvars_secrets(content, relative, result)
             self._extract_providers(content, relative, result)
             self._extract_resources(content, relative, result)
             self._extract_variables(content, relative, result)
@@ -259,12 +581,11 @@ class TerraformAnalyzer:
 
     def _extract_providers(self, content: str, relative: str, result: ScanResult) -> None:
         for match in PROVIDER_BLOCK_PATTERN.finditer(content):
-            provider = match.group(1)
-            label = _PROVIDER_LABEL.get(provider, f"terraform-{provider}")
-            self._append_unique_framework(
-                result, label, relative,
+            self._handle_provider(
+                match.group(1), relative,
                 line_of(content, match.start()),
                 _line_snippet(content, match.start()),
+                result,
             )
 
     def _extract_resources(self, content: str, relative: str, result: ScanResult) -> None:
@@ -272,35 +593,133 @@ class TerraformAnalyzer:
             resource_type, resource_name = match.group(1), match.group(2)
             body, _ = _block_body(content, match.end())
             line = line_of(content, match.start())
-            self._dispatch_resource(resource_type, resource_name, body, relative, line, content, match.start(), result)
+            self._dispatch_resource(
+                resource_type, resource_name, body, relative, line,
+                _line_snippet(content, match.start()), result,
+            )
 
     def _extract_variables(self, content: str, relative: str, result: ScanResult) -> None:
         for match in VARIABLE_BLOCK_PATTERN.finditer(content):
-            var_name = match.group(1)
             body, _ = _block_body(content, match.end())
-            line = line_of(content, match.start())
-            sensitive = (_extract_attr(body, "sensitive") or "").lower() == "true"
-            if sensitive or _looks_secret_shaped(var_name):
-                self._append_unique_secret(
-                    result, var_name, relative, line,
-                    _line_snippet(content, match.start()),
-                )
+            self._handle_variable(
+                match.group(1), body, relative,
+                line_of(content, match.start()),
+                _line_snippet(content, match.start()),
+                result,
+            )
 
     def _extract_modules(self, content: str, relative: str, result: ScanResult) -> None:
         for match in MODULE_BLOCK_PATTERN.finditer(content):
-            module_name = match.group(1)
-            self._append_unique_service(result, f"module:{module_name}", relative)
+            self._append_unique_service(result, f"module:{match.group(1)}", relative)
 
     def _extract_data_sources(self, content: str, relative: str, result: ScanResult) -> None:
-        # data "aws_secretsmanager_secret" "x" { ... } — surface secret references via data.
         for match in DATA_BLOCK_PATTERN.finditer(content):
-            data_type, data_name = match.group(1), match.group(2)
-            line = line_of(content, match.start())
-            if data_type in {"aws_secretsmanager_secret", "aws_secretsmanager_secret_version", "aws_ssm_parameter"}:
-                self._append_unique_secret(
-                    result, f"data:{data_type}:{data_name}", relative, line,
-                    _line_snippet(content, match.start()),
+            body, _ = _block_body(content, match.end())
+            self._handle_data_source(
+                match.group(1), match.group(2), body, relative,
+                line_of(content, match.start()),
+                _line_snippet(content, match.start()),
+                result,
+            )
+
+    def _extract_tfvars_secrets(self, content: str, relative: str, result: ScanResult) -> None:
+        """``.tfvars`` assign values to variables: a secret-shaped key with a
+        non-empty string literal is a credential committed to the repo."""
+        depths, in_string = _scan_text(content)
+        for match in _TFVARS_ASSIGN_RE.finditer(content):
+            if not _at_top(depths, in_string, content, match.start(1)):
+                continue
+            key, value = match.group(1), match.group(2)
+            if not value.strip() or not _tfvars_key_is_secret(key) or _looks_like_reference(value):
+                continue
+            line = line_of(content, match.start(1))
+            self._append_unique_secret(
+                result, key, relative, line,
+                # Never echo the literal itself into the report.
+                f'{key} = "<redacted>"',
+                kind="hardcoded",
+            )
+
+    def _analyze_tf_json(self, content: str, relative: str, result: ScanResult) -> None:
+        """Terraform JSON syntax (``*.tf.json``, e.g. CDKTF output). Each block
+        is rendered back to HCL and sent through the same handlers as ``.tf``
+        files, with line/evidence taken from the JSON source."""
+        try:
+            document = json.loads(content)
+        except ValueError:
+            return
+        if not isinstance(document, dict):
+            return
+        locator = _JsonLocator(content)
+        locator.find("provider")
+
+        for provider_obj in _json_objects(document.get("provider")):
+            for provider in provider_obj:
+                offset = locator.find(provider)
+                self._handle_provider(
+                    provider, relative, line_of(content, offset), _line_snippet(content, offset), result,
                 )
+        for kind in ("resource", "data"):
+            locator.find(kind, from_start=True)
+            for type_obj in _json_objects(document.get(kind)):
+                for block_type, named in type_obj.items():
+                    locator.find(block_type)
+                    for named_obj in _json_objects(named):
+                        for block_name, raw_body in named_obj.items():
+                            offset = locator.find(block_name)
+                            line = line_of(content, offset)
+                            ev = _line_snippet(content, offset)
+                            for body_obj in _json_objects(raw_body):
+                                body = _json_to_hcl(body_obj)
+                                if kind == "resource":
+                                    self._dispatch_resource(block_type, block_name, body, relative, line, ev, result)
+                                else:
+                                    self._handle_data_source(block_type, block_name, body, relative, line, ev, result)
+        locator.find("variable", from_start=True)
+        for var_obj in _json_objects(document.get("variable")):
+            for var_name, raw_body in var_obj.items():
+                offset = locator.find(var_name)
+                for body_obj in _json_objects(raw_body) or [{}]:
+                    self._handle_variable(
+                        var_name, _json_to_hcl(body_obj), relative,
+                        line_of(content, offset), _line_snippet(content, offset), result,
+                    )
+        for module_obj in _json_objects(document.get("module")):
+            for module_name in module_obj:
+                self._append_unique_service(result, f"module:{module_name}", relative)
+
+    # ---------- Block handlers (shared by HCL and JSON syntax) ----------
+
+    def _handle_provider(self, provider: str, file: str, line: int, ev: str, result: ScanResult) -> None:
+        label = _PROVIDER_LABEL.get(provider, f"terraform-{provider}")
+        self._append_unique_framework(result, label, file, line, ev)
+
+    def _handle_variable(self, var_name: str, body: str, file: str, line: int, ev: str, result: ScanResult) -> None:
+        sensitive = (_extract_attr(body, "sensitive") or "").lower() == "true"
+        if sensitive or _looks_secret_shaped(var_name):
+            self._append_unique_secret(result, var_name, file, line, ev)
+
+    def _handle_data_source(
+        self, data_type: str, data_name: str, body: str, file: str, line: int, ev: str, result: ScanResult,
+    ) -> None:
+        # data "aws_secretsmanager_secret" "x" { ... } — surface secret references via data.
+        if data_type in {"aws_secretsmanager_secret", "aws_secretsmanager_secret_version", "aws_ssm_parameter"}:
+            self._append_unique_secret(result, f"data:{data_type}:{data_name}", file, line, ev)
+            return
+        if data_type == "aws_iam_policy_document":
+            self._emit_policy_findings(_scan_policy_document(body), data_name, file, line, ev, result)
+
+    def _emit_policy_findings(
+        self, findings: _PolicyFindings, name: str, file: str, line: int, ev: str, result: ScanResult,
+    ) -> None:
+        if findings.wildcard_action:
+            self._append_unique_auth(result, f"iam_wildcard_action:{name}", file, line, ev, 0.7)
+        if findings.wildcard_resource:
+            # Resource "*" with scoped actions is common (Describe*, logs), so
+            # this is a weaker smell than a wildcard action.
+            self._append_unique_auth(result, f"iam_wildcard_resource:{name}", file, line, ev, 0.5)
+        if findings.public_principal:
+            self._append_unique_auth(result, f"iam_wildcard_principal:{name}", file, line, ev, 0.7)
 
     # ---------- Resource dispatchers ----------
 
@@ -311,20 +730,21 @@ class TerraformAnalyzer:
         body: str,
         file: str,
         line: int,
-        content: str,
-        offset: int,
+        ev: str,
         result: ScanResult,
     ) -> None:
-        ev = _line_snippet(content, offset)
-
         # ---- AWS ----
-        if resource_type == "aws_security_group" and _has_open_cidr(body):
-            self._append_unique_entrypoint(
-                result, f"sg_open_ingress:{resource_name}", file, line, ev,
-            )
+        if resource_type == "aws_security_group":
+            if _has_open_ingress(body):
+                self._append_unique_entrypoint(
+                    result, f"sg_open_ingress:{resource_name}", file, line, ev,
+                )
             return
         if resource_type in {"aws_security_group_rule", "aws_vpc_security_group_ingress_rule"} and _has_open_cidr(body):
             direction = (_extract_attr(body, "type") or "").lower() or "ingress"
+            if direction == "egress":
+                # Open egress is the default posture, not exposure.
+                return
             self._append_unique_entrypoint(
                 result, f"sg_rule_{direction}_open:{resource_name}", file, line, ev,
             )
@@ -375,10 +795,26 @@ class TerraformAnalyzer:
             return
         if resource_type == "aws_s3_bucket":
             self._append_unique_service(result, f"s3_bucket:{resource_name}", file)
+            # AWS provider <= v3 inline `acl` / `policy` arguments.
+            acl = (_extract_attr(body, "acl") or "").lower()
+            if acl in _PUBLIC_S3_ACLS:
+                self._append_unique_entrypoint(
+                    result, f"s3_public_acl:{resource_name}", file, line, ev,
+                )
+            if _scan_json_policies(_attr_value(body, "policy") or "").public_principal:
+                self._append_unique_entrypoint(
+                    result, f"s3_public_policy:{resource_name}", file, line, ev,
+                )
+            return
+        if resource_type == "aws_s3_bucket_policy":
+            if _scan_json_policies(body).public_principal:
+                self._append_unique_entrypoint(
+                    result, f"s3_public_policy:{resource_name}", file, line, ev,
+                )
             return
         if resource_type == "aws_s3_bucket_acl":
             acl = (_extract_attr(body, "acl") or "").lower()
-            if acl in {"public-read", "public-read-write"}:
+            if acl in _PUBLIC_S3_ACLS:
                 self._append_unique_entrypoint(
                     result, f"s3_public_acl:{resource_name}", file, line, ev,
                 )
@@ -428,11 +864,10 @@ class TerraformAnalyzer:
         if resource_type == "aws_cognito_user_pool":
             self._append_unique_auth(result, f"cognito_user_pool:{resource_name}", file, line, ev, 0.85)
             return
-        if resource_type in {"aws_iam_policy", "aws_iam_role_policy", "aws_iam_user_policy"}:
-            if _has_iam_wildcard_action(body):
-                self._append_unique_auth(
-                    result, f"iam_wildcard_action:{resource_name}", file, line, ev, 0.7,
-                )
+        if resource_type in _IAM_POLICY_RESOURCES:
+            # Identity policies (Action/Resource) and, for aws_iam_role, the
+            # assume_role_policy trust document (Principal) plus inline_policy.
+            self._emit_policy_findings(_scan_json_policies(body), resource_name, file, line, ev, result)
             return
 
         # ---- Azure ----
@@ -442,7 +877,11 @@ class TerraformAnalyzer:
         if resource_type == "azurerm_key_vault":
             self._append_unique_service(result, f"key_vault:{resource_name}", file)
             return
-        if resource_type == "azurerm_network_security_rule" and _has_open_cidr(body):
+        if (
+            resource_type == "azurerm_network_security_rule"
+            and _has_open_cidr(body)
+            and (_extract_attr(body, "direction") or "inbound").lower() != "outbound"
+        ):
             self._append_unique_entrypoint(
                 result, f"azure_nsg_open:{resource_name}", file, line, ev,
             )
@@ -461,7 +900,11 @@ class TerraformAnalyzer:
         if resource_type == "google_storage_bucket":
             self._append_unique_service(result, f"gcs_bucket:{resource_name}", file)
             return
-        if resource_type == "google_compute_firewall" and _has_open_cidr(body):
+        if (
+            resource_type == "google_compute_firewall"
+            and _has_open_cidr(body)
+            and (_extract_attr(body, "direction") or "ingress").lower() != "egress"
+        ):
             self._append_unique_entrypoint(
                 result, f"gcp_firewall_open:{resource_name}", file, line, ev,
             )
@@ -502,11 +945,22 @@ class TerraformAnalyzer:
         result.auth_hints.append(AuthHint(hint=hint, file=file, line=line, evidence_text=evidence, confidence=confidence))
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str, line: int | None, evidence: str | None) -> None:
+    def _append_unique_secret(
+        result: ScanResult,
+        name: str,
+        file: str,
+        line: int | None,
+        evidence: str | None,
+        *,
+        kind: str | None = None,
+    ) -> None:
         key = (name, file)
         if any((item.name, item.file) == key for item in result.secret_hints):
             return
-        result.secret_hints.append(SecretHint(name=name, file=file, line=line, evidence_text=evidence, confidence=0.85))
+        extra = {"kind": kind} if kind is not None else {}
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=evidence, confidence=0.85, **extra)
+        )
 
     @staticmethod
     def _append_unique_external(result: ScanResult, target: str, file: str, line: int | None, evidence: str | None) -> None:

@@ -562,3 +562,531 @@ def test_symlinked_file_outside_repo_not_analyzed(tmp_path: Path) -> None:
     assert result.files_scanned == 1
     assert result.secret_hints == []
     assert result.framework_hints == []
+
+
+# ---------- #3: misreads (egress, IAM documents, S3, tfvars, .tf.json) ----------
+
+
+_ISSUE3_MAIN_TF = '''provider "aws" {
+  region = "us-east-1"
+}
+
+resource "aws_security_group" "internal" {
+  name = "internal"
+  ingress {
+    from_port   = 5432
+    to_port     = 5432
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/8"]
+  }
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+data "aws_iam_policy_document" "admin" {
+  statement {
+    effect    = "Allow"
+    actions   = ["*"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_s3_bucket" "assets" {
+  bucket = "assets"
+  acl    = "public-read"
+}
+'''
+
+_ISSUE3_RDS_TF_JSON = '''{
+  "resource": {
+    "aws_db_instance": {
+      "main": {
+        "engine": "postgres",
+        "instance_class": "db.t3.micro",
+        "publicly_accessible": true
+      }
+    }
+  }
+}
+'''
+
+
+def _write(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+
+
+def _signals(result) -> set[tuple[str, str]]:
+    """Every emitted security-relevant signal as (category, identity)."""
+    out: set[tuple[str, str]] = set()
+    out |= {("entrypoint", e.hint) for e in result.entrypoint_hints}
+    out |= {("auth", a.hint) for a in result.auth_hints}
+    out |= {("secret", s.name) for s in result.secret_hints}
+    out |= {("database", d.kind) for d in result.databases}
+    out |= {("service", s.hint) for s in result.service_hints}
+    out |= {("framework", f.hint) for f in result.framework_hints}
+    out |= {("route", f"{r.method} {r.path}") for r in result.routes}
+    return out
+
+
+def test_issue3_fixture_has_no_false_positives_and_all_true_positives(tmp_path: Path) -> None:
+    _write(tmp_path / "main.tf", _ISSUE3_MAIN_TF)
+    _write(tmp_path / "prod.tfvars", 'region      = "us-east-1"\ndb_password = "hunter2-prod"\n')
+    _write(tmp_path / "rds.tf.json", _ISSUE3_RDS_TF_JSON)
+    result = TerraformAnalyzer().analyze(tmp_path)
+
+    eps = {e.hint for e in result.entrypoint_hints}
+    assert eps == {"s3_public_acl:assets", "rds_publicly_accessible:main"}
+    assert "iam_wildcard_action:admin" in {a.hint for a in result.auth_hints}
+    secret = next(s for s in result.secret_hints if s.name == "db_password")
+    assert secret.kind == "hardcoded"
+    assert secret.file == "prod.tfvars" and secret.line == 2
+    assert "hunter2" not in (secret.evidence_text or "")
+    assert not any(s.name == "region" for s in result.secret_hints)
+    rds = next(e for e in result.entrypoint_hints if e.hint == "rds_publicly_accessible:main")
+    assert (rds.file, rds.line) == ("rds.tf.json", 4)
+    assert any(d.kind == "postgresql" and d.file == "rds.tf.json" for d in result.databases)
+
+
+def test_security_group_with_only_open_egress_is_not_open_ingress(tmp_path: Path) -> None:
+    _write(tmp_path / "sg.tf", _ISSUE3_MAIN_TF)
+    result = TerraformAnalyzer().analyze(tmp_path)
+    assert not any("sg_open" in e.hint for e in result.entrypoint_hints)
+
+
+def test_security_group_open_ipv6_ingress_still_fires(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "sg.tf",
+        'resource "aws_security_group" "web" {\n'
+        '  egress {\n'
+        '    cidr_blocks = ["0.0.0.0/0"]\n'
+        '  }\n'
+        '  ingress {\n'
+        '    from_port        = 443\n'
+        '    to_port          = 443\n'
+        '    ipv6_cidr_blocks = ["::/0"]\n'
+        '  }\n'
+        '}\n',
+    )
+    result = TerraformAnalyzer().analyze(tmp_path)
+    assert "sg_open_ingress:web" in {e.hint for e in result.entrypoint_hints}
+
+
+def test_security_group_attribute_syntax_ingress(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "sg.tf",
+        'resource "aws_security_group" "attr_open" {\n'
+        '  ingress = [{\n'
+        '    from_port   = 22\n'
+        '    to_port     = 22\n'
+        '    protocol    = "tcp"\n'
+        '    cidr_blocks = ["0.0.0.0/0"]\n'
+        '  }]\n'
+        '}\n'
+        'resource "aws_security_group" "attr_egress" {\n'
+        '  ingress = []\n'
+        '  egress = [{\n'
+        '    cidr_blocks = ["0.0.0.0/0"]\n'
+        '  }]\n'
+        '}\n',
+    )
+    hints = {e.hint for e in TerraformAnalyzer().analyze(tmp_path).entrypoint_hints}
+    assert "sg_open_ingress:attr_open" in hints
+    assert "sg_open_ingress:attr_egress" not in hints
+
+
+def test_egress_rules_are_not_reported_as_open(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "rules.tf",
+        'resource "aws_security_group_rule" "out" {\n'
+        '  type        = "egress"\n'
+        '  cidr_blocks = ["0.0.0.0/0"]\n'
+        '}\n'
+        'resource "aws_security_group_rule" "in" {\n'
+        '  type        = "ingress"\n'
+        '  cidr_blocks = ["0.0.0.0/0"]\n'
+        '}\n'
+        'resource "azurerm_network_security_rule" "out" {\n'
+        '  direction                  = "Outbound"\n'
+        '  destination_address_prefix = "0.0.0.0/0"\n'
+        '}\n'
+        'resource "google_compute_firewall" "out" {\n'
+        '  direction          = "EGRESS"\n'
+        '  destination_ranges = ["0.0.0.0/0"]\n'
+        '}\n',
+    )
+    hints = {e.hint for e in TerraformAnalyzer().analyze(tmp_path).entrypoint_hints}
+    assert hints == {"sg_rule_ingress_open:in"}
+
+
+def test_extract_attr_ignores_nested_block_attributes(tmp_path: Path) -> None:
+    # `type = "SecureString"` lives in a nested map, the parameter itself is a
+    # plain String: no secret.
+    _write(
+        tmp_path / "ssm.tf",
+        'resource "aws_ssm_parameter" "cfg" {\n'
+        '  tags = {\n'
+        '    type = "SecureString"\n'
+        '  }\n'
+        '  name  = "/app/config"\n'
+        '  type  = "String"\n'
+        '  value = "x"\n'
+        '}\n',
+    )
+    result = TerraformAnalyzer().analyze(tmp_path)
+    assert not any(s.name == "ssm:cfg" for s in result.secret_hints)
+
+
+def test_extract_attr_nested_type_does_not_mislabel_rule_direction(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "rule.tf",
+        'resource "aws_security_group_rule" "in" {\n'
+        '  timeouts {\n'
+        '    type = "egress"\n'
+        '  }\n'
+        '  type        = "ingress"\n'
+        '  cidr_blocks = ["0.0.0.0/0"]\n'
+        '}\n',
+    )
+    hints = {e.hint for e in TerraformAnalyzer().analyze(tmp_path).entrypoint_hints}
+    assert hints == {"sg_rule_ingress_open:in"}
+
+
+def test_policy_document_wildcards(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "iam.tf",
+        'data "aws_iam_policy_document" "admin" {\n'
+        '  statement {\n'
+        '    actions   = ["*"]\n'
+        '    resources = ["*"]\n'
+        '  }\n'
+        '}\n'
+        'data "aws_iam_policy_document" "describe" {\n'
+        '  statement {\n'
+        '    actions   = ["ec2:Describe*", "s3:*"]\n'
+        '    resources = ["*"]\n'
+        '  }\n'
+        '}\n'
+        'data "aws_iam_policy_document" "scoped" {\n'
+        '  statement {\n'
+        '    actions   = ["s3:GetObject"]\n'
+        '    resources = ["arn:aws:s3:::bucket/*"]\n'
+        '  }\n'
+        '}\n'
+        'data "aws_iam_policy_document" "deny_all" {\n'
+        '  statement {\n'
+        '    effect    = "Deny"\n'
+        '    actions   = ["*"]\n'
+        '    resources = ["*"]\n'
+        '  }\n'
+        '}\n',
+    )
+    by_hint = {a.hint: a for a in TerraformAnalyzer().analyze(tmp_path).auth_hints}
+    assert by_hint["iam_wildcard_action:admin"].confidence == 0.7
+    assert by_hint["iam_wildcard_resource:admin"].confidence == 0.5
+    assert by_hint["iam_wildcard_action:admin"].line == 1
+    assert "iam_wildcard_resource:describe" in by_hint
+    assert "iam_wildcard_action:describe" not in by_hint
+    assert not any(h.endswith((":scoped", ":deny_all")) for h in by_hint)
+
+
+def test_policy_document_wildcard_principal(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "trust.tf",
+        'data "aws_iam_policy_document" "anyone" {\n'
+        '  statement {\n'
+        '    actions = ["sts:AssumeRole"]\n'
+        '    principals {\n'
+        '      type        = "AWS"\n'
+        '      identifiers = ["*"]\n'
+        '    }\n'
+        '  }\n'
+        '}\n'
+        'data "aws_iam_policy_document" "conditioned" {\n'
+        '  statement {\n'
+        '    actions = ["sts:AssumeRole"]\n'
+        '    principals {\n'
+        '      type        = "AWS"\n'
+        '      identifiers = ["*"]\n'
+        '    }\n'
+        '    condition {\n'
+        '      test     = "StringEquals"\n'
+        '      variable = "aws:PrincipalOrgID"\n'
+        '      values   = ["o-123"]\n'
+        '    }\n'
+        '  }\n'
+        '}\n'
+        'data "aws_iam_policy_document" "lambda" {\n'
+        '  statement {\n'
+        '    actions = ["sts:AssumeRole"]\n'
+        '    principals {\n'
+        '      type        = "Service"\n'
+        '      identifiers = ["lambda.amazonaws.com"]\n'
+        '    }\n'
+        '  }\n'
+        '}\n',
+    )
+    hints = {a.hint for a in TerraformAnalyzer().analyze(tmp_path).auth_hints}
+    assert hints == {"iam_wildcard_principal:anyone"}
+
+
+def test_role_trust_policy_wildcard_principal(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "role.tf",
+        'resource "aws_iam_role" "open" {\n'
+        '  assume_role_policy = jsonencode({\n'
+        '    Version = "2012-10-17"\n'
+        '    Statement = [{\n'
+        '      Effect    = "Allow"\n'
+        '      Action    = "sts:AssumeRole"\n'
+        '      Principal = { AWS = "*" }\n'
+        '    }]\n'
+        '  })\n'
+        '}\n'
+        'resource "aws_iam_role" "star" {\n'
+        '  assume_role_policy = <<EOF\n'
+        '{\n'
+        '  "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": "*"}]\n'
+        '}\n'
+        'EOF\n'
+        '}\n'
+        'resource "aws_iam_role" "lambda" {\n'
+        '  assume_role_policy = jsonencode({\n'
+        '    Statement = [{\n'
+        '      Effect    = "Allow"\n'
+        '      Action    = "sts:AssumeRole"\n'
+        '      Principal = { Service = "lambda.amazonaws.com" }\n'
+        '    }]\n'
+        '  })\n'
+        '}\n',
+    )
+    hints = {a.hint for a in TerraformAnalyzer().analyze(tmp_path).auth_hints}
+    assert hints == {"iam_wildcard_principal:open", "iam_wildcard_principal:star"}
+
+
+def test_iam_policy_keys_are_case_insensitive_and_resource_checked(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "iam.tf",
+        'resource "aws_iam_policy" "lower" {\n'
+        '  policy = <<EOF\n'
+        '{"statement": [{"effect": "Allow", "action": ["*"], "resource": "arn:aws:s3:::b"}]}\n'
+        'EOF\n'
+        '}\n'
+        'resource "aws_iam_policy" "res" {\n'
+        '  policy = jsonencode({Statement = [{Effect = "Allow", Action = ["logs:PutLogEvents"], Resource = "*"}]})\n'
+        '}\n'
+        'resource "aws_iam_policy" "denied" {\n'
+        '  policy = jsonencode({Statement = [{Effect = "Deny", Action = "*", Resource = "*"}]})\n'
+        '}\n',
+    )
+    hints = {a.hint for a in TerraformAnalyzer().analyze(tmp_path).auth_hints}
+    assert hints == {"iam_wildcard_action:lower", "iam_wildcard_resource:res"}
+
+
+def test_s3_inline_acl_and_bucket_policy(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "s3.tf",
+        'resource "aws_s3_bucket" "private" {\n'
+        '  bucket = "private"\n'
+        '  acl    = "private"\n'
+        '}\n'
+        'resource "aws_s3_bucket" "inline_policy" {\n'
+        '  bucket = "site"\n'
+        '  policy = <<EOF\n'
+        '{"Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/*"}]}\n'
+        'EOF\n'
+        '}\n'
+        'resource "aws_s3_bucket_policy" "public" {\n'
+        '  bucket = aws_s3_bucket.private.id\n'
+        '  policy = jsonencode({\n'
+        '    Statement = [{\n'
+        '      Effect    = "Allow"\n'
+        '      Principal = { AWS = ["*"] }\n'
+        '      Action    = "s3:GetObject"\n'
+        '      Resource  = "arn:aws:s3:::private/*"\n'
+        '    }]\n'
+        '  })\n'
+        '}\n'
+        'resource "aws_s3_bucket_policy" "tls_only" {\n'
+        '  bucket = aws_s3_bucket.private.id\n'
+        '  policy = jsonencode({\n'
+        '    Statement = [{\n'
+        '      Effect    = "Deny"\n'
+        '      Principal = "*"\n'
+        '      Action    = "s3:*"\n'
+        '      Resource  = "arn:aws:s3:::private/*"\n'
+        '      Condition = { Bool = { "aws:SecureTransport" = "false" } }\n'
+        '    }]\n'
+        '  })\n'
+        '}\n',
+    )
+    hints = {e.hint for e in TerraformAnalyzer().analyze(tmp_path).entrypoint_hints}
+    assert hints == {"s3_public_policy:inline_policy", "s3_public_policy:public"}
+
+
+def test_tfvars_hardcoded_secrets(tmp_path: Path) -> None:
+    _write(
+        tmp_path / "terraform.tfvars",
+        '# comment\n'
+        'region          = "us-east-1"\n'
+        'api_token       = "tok_live_abc"\n'
+        'kms_key_id      = "1234abcd-12ab"\n'
+        'ssh_key_name    = "deployer"\n'
+        'db_password     = ""\n'
+        'secret_arn      = "arn:aws:secretsmanager:us-east-1:1:secret:x"\n'
+        'tags = {\n'
+        '  password = "not-top-level"\n'
+        '}\n',
+    )
+    result = TerraformAnalyzer().analyze(tmp_path)
+    secrets = {s.name: s for s in result.secret_hints}
+    assert set(secrets) == {"api_token"}
+    assert secrets["api_token"].kind == "hardcoded"
+    assert secrets["api_token"].line == 3
+    assert "tok_live" not in (secrets["api_token"].evidence_text or "")
+
+
+_PARITY_HCL = '''provider "aws" {
+  region = "us-east-1"
+}
+
+variable "db_password" {
+  type      = string
+  sensitive = true
+}
+
+resource "aws_security_group" "internal" {
+  ingress {
+    cidr_blocks = ["10.0.0.0/8"]
+  }
+  egress {
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_security_group" "web" {
+  ingress {
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_db_instance" "main" {
+  engine              = "postgres"
+  publicly_accessible = true
+}
+
+resource "aws_s3_bucket" "assets" {
+  acl = "public-read"
+}
+
+resource "aws_iam_role" "open" {
+  assume_role_policy = <<EOT
+{"Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole", "Principal": {"AWS": "*"}}]}
+EOT
+}
+
+resource "aws_apigatewayv2_route" "create" {
+  route_key          = "POST /users"
+  authorization_type = "NONE"
+}
+
+resource "aws_ssm_parameter" "cfg" {
+  type = "String"
+  tags = {
+    type = "SecureString"
+  }
+}
+
+data "aws_iam_policy_document" "admin" {
+  statement {
+    actions   = ["*"]
+    resources = ["*"]
+  }
+}
+
+module "vpc" {
+  source = "./vpc"
+}
+'''
+
+_PARITY_JSON = '''{
+  "provider": {"aws": {"region": "us-east-1"}},
+  "variable": {"db_password": {"type": "string", "sensitive": true}},
+  "resource": {
+    "aws_security_group": {
+      "internal": {
+        "ingress": [{"cidr_blocks": ["10.0.0.0/8"]}],
+        "egress": [{"cidr_blocks": ["0.0.0.0/0"]}]
+      },
+      "web": {"ingress": [{"cidr_blocks": ["0.0.0.0/0"]}]}
+    },
+    "aws_db_instance": {"main": {"engine": "postgres", "publicly_accessible": true}},
+    "aws_s3_bucket": {"assets": {"acl": "public-read"}},
+    "aws_iam_role": {
+      "open": {
+        "assume_role_policy": "{\\"Statement\\": [{\\"Effect\\": \\"Allow\\", \\"Action\\": \\"sts:AssumeRole\\", \\"Principal\\": {\\"AWS\\": \\"*\\"}}]}"
+      }
+    },
+    "aws_apigatewayv2_route": {"create": {"route_key": "POST /users", "authorization_type": "NONE"}},
+    "aws_ssm_parameter": {"cfg": {"type": "String", "tags": {"type": "SecureString"}}}
+  },
+  "data": {
+    "aws_iam_policy_document": {
+      "admin": {"statement": [{"actions": ["*"], "resources": ["*"]}]}
+    }
+  },
+  "module": {"vpc": {"source": "./vpc"}}
+}
+'''
+
+
+def test_tf_json_resources_are_analyzed_identically_to_hcl(tmp_path: Path) -> None:
+    hcl_repo = tmp_path / "hcl"
+    json_repo = tmp_path / "json"
+    hcl_repo.mkdir()
+    json_repo.mkdir()
+    _write(hcl_repo / "main.tf", _PARITY_HCL)
+    _write(json_repo / "main.tf.json", _PARITY_JSON)
+
+    hcl = TerraformAnalyzer().analyze(hcl_repo)
+    from_json = TerraformAnalyzer().analyze(json_repo)
+
+    expected = {
+        ("framework", "terraform-aws"),
+        ("secret", "db_password"),
+        ("entrypoint", "sg_open_ingress:web"),
+        ("entrypoint", "rds_publicly_accessible:main"),
+        ("entrypoint", "s3_public_acl:assets"),
+        ("entrypoint", "apigwv2_open:create"),
+        ("auth", "iam_wildcard_principal:open"),
+        ("auth", "iam_wildcard_action:admin"),
+        ("auth", "iam_wildcard_resource:admin"),
+        ("database", "postgresql"),
+        ("service", "rds:main"),
+        ("service", "s3_bucket:assets"),
+        ("service", "module:vpc"),
+        ("route", "POST /users"),
+    }
+    assert _signals(hcl) == expected
+    assert _signals(from_json) == expected
+
+
+def test_tf_json_lines_point_at_the_json_source(tmp_path: Path) -> None:
+    _write(tmp_path / "main.tf.json", _PARITY_JSON)
+    result = TerraformAnalyzer().analyze(tmp_path)
+    web = next(e for e in result.entrypoint_hints if e.hint == "sg_open_ingress:web")
+    assert web.file == "main.tf.json"
+    assert web.line == _PARITY_JSON.splitlines().index(
+        next(line for line in _PARITY_JSON.splitlines() if '"web"' in line)
+    ) + 1
+    assert '"web"' in (web.evidence_text or "")
+
+
+def test_tf_json_invalid_json_is_skipped(tmp_path: Path) -> None:
+    _write(tmp_path / "broken.tf.json", '{"resource": ')
+    result = TerraformAnalyzer().analyze(tmp_path)
+    assert result.files_scanned == 1
+    assert _signals(result) == set()
