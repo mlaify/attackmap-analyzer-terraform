@@ -20,6 +20,9 @@ This analyzer is shaped differently from language analyzers — Terraform doesn'
 - **Cognito** — `aws_cognito_user_pool` → `auth_hints`
 - **Modules** — `module "x" { source = ... }` → `service_hints` keyed `module:x`
 - **API Gateway v2 routes** — `aws_apigatewayv2_route` with `route_key = "POST /charges"` → actual `Route` entries
+- **API Gateway v1 routes** — `aws_api_gateway_method` on an `aws_api_gateway_resource` chain (`parent_id` / `path_part` joined back to `root_resource_id`, across files) → `Route` entries
+- **Lambda function URLs** — `aws_lambda_function_url` → an `ANY /` `Route`
+- **Route auth (AttackMap#256)** — every route carries `auth` / `guards` / `guard_evidence`. `authorization` / `authorization_type` = `AWS_IAM`, `COGNITO_USER_POOLS`, `CUSTOM` or `JWT` (or v1 `api_key_required = true`) → `required`. `"NONE"` written out → `anonymous`. Omitted or computed (`var.x`) → `unknown`.
 
 All emissions populate AttackMap's Signal v2 fields (line numbers + evidence snippets) so downstream insights can cite `infra/main.tf:NN`.
 
@@ -54,7 +57,7 @@ The analyzer parses HCL block bodies via brace-depth counting (with string-liter
 - **AWS** is the most thoroughly covered provider. Azure and GCP have basic coverage (NSG/firewall open ingress, Storage Account / GCS bucket as service hints, PostgreSQL/MySQL/CosmosDB/CloudSQL as databases) — extend per resource type as needed.
 - **IAM wildcard detection** matches JSON-shaped (`"Action": "*"`, heredoc or `.tf.json` string) and HCL-shaped (`Action = "*"` in `jsonencode`, `actions = ["*"]` in `aws_iam_policy_document`) policies. A `policy = data.aws_iam_policy_document.x.json` reference isn't followed; the data source is reported under its own name.
 - **`.tf.json`** files get the same analysis as `.tf`. **`.tfvars`** files are checked for secret-shaped string literals (reported as `kind="hardcoded"` with the value redacted).
-- **API Gateway v1** routing is partial — only individual `aws_api_gateway_method` resources emit entrypoint hints. Path joining across `aws_api_gateway_resource` chains is not yet implemented (use API Gateway v2 / `aws_apigatewayv2_route` for full path+method extraction).
+- **API Gateway v1** methods become routes when their `resource_id` resolves through literal `aws_api_gateway_resource` blocks to a `root_resource_id`. Methods on resources from modules or with interpolated `path_part`s only emit entrypoint hints. OpenAPI `body`-defined REST APIs aren't parsed.
 - **Lambda Function URLs** with `authorization_type = "NONE"` are flagged as open entrypoints. IAM-authorized URLs are emitted with the regular `lambda_url:` prefix.
 - **Database `publicly_accessible = true`** on `aws_db_instance` produces a separate `rds_publicly_accessible:` entrypoint hint in addition to the standard database hint.
 

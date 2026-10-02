@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Routes carry their auth in the core contract (#8, AttackMap#256).** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the authorizer type (and `authorizer_id`) and `guard_evidence` quoting the attribute lines. `AWS_IAM` / `COGNITO_USER_POOLS` / `CUSTOM` / `JWT` (and v1 `api_key_required = true`) are `required`. An explicit `"NONE"` is `anonymous`. An omitted or computed value is `unknown`. AttackMap ≥ 0.6 trusts this over its ±40-line auth-hint window. Older cores ignore the fields, and the `apigw_open_method:*` / `apigwv2_open:*` / `lambda_url_open:*` entrypoint hints are kept for one release.
+- **API Gateway v1 methods are routes.** An `aws_api_gateway_method` whose `resource_id` resolves through literal `aws_api_gateway_resource` `parent_id` / `path_part` chains to the API's `root_resource_id` is emitted as a `Route` (e.g. `DELETE /orders/{id}`), resolved across files after the walk. Unresolvable ones keep only their entrypoint hint.
+- **Lambda function URLs are routes.** Each `aws_lambda_function_url` is an `ANY /` `Route` carrying its `authorization_type`.
+
 - `data "aws_iam_policy_document"` `statement { }` blocks are checked for wildcard `actions`, `resources` and `principals` (#3).
 - `aws_iam_role` trust (`assume_role_policy`) and inline policies, and `aws_iam_group_policy`, are checked; Allow statements with `Principal "*"` and no `Condition` emit `iam_wildcard_principal:<name>` (#3).
 - `Resource "*"` now emits `iam_wildcard_resource:<name>` (confidence 0.5), as the docs already claimed (#3).

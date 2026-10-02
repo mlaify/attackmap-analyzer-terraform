@@ -516,6 +516,47 @@ class _JsonLocator:
         return match.start()
 
 
+# ---------- Route auth (AttackMap#256) ----------
+
+REQUIRED, ANONYMOUS, UNKNOWN = "required", "anonymous", "unknown"
+# API Gateway / Lambda URL authorization values that authenticate the caller.
+_APIGW_GUARDS = frozenset({"AWS_IAM", "COGNITO_USER_POOLS", "CUSTOM", "JWT"})
+_APIGW_ROOT_REF = re.compile(r"^aws_api_gateway_rest_api\.[\w-]+\.root_resource_id$")
+_APIGW_RESOURCE_REF = re.compile(r"^aws_api_gateway_resource\.([\w-]+)\.id$")
+_APIGW_PATH_DEPTH = 32
+_APIGW_PATH_PART = re.compile(r"^[\w.~+{}-]+$")
+_TF_REFERENCE = re.compile(r"^(?:var|local|module|data|each|count|aws_\w+)\.")
+
+
+def _attr_line(body: str, name: str) -> str | None:
+    """The source text of a top-level ``name = ...`` attribute line."""
+    match = re.search(rf"^[ \t]*{re.escape(name)}[ \t]*=[^\n]*", _top_level(body), re.MULTILINE)
+    return " ".join(match.group(0).split()) if match else None
+
+
+def _route_auth(body: str, attr: str, extra_guards: tuple[str, ...] = ()) -> tuple[str, list[str], str | None]:
+    """``(auth, guards, evidence)`` from an ``authorization`` /
+    ``authorization_type`` attribute. ``NONE`` written out is explicitly
+    public; an absent or computed value (``var.x``) is unknown."""
+    value = (_extract_attr(body, attr) or "").strip()
+    evidence = _attr_line(body, attr)
+    guards: list[str] = []
+    lines: list[str] = []
+    if value.upper() in _APIGW_GUARDS:
+        authorizer = _extract_attr(body, "authorizer_id")
+        guards.append(value.upper() + (f" ({authorizer})" if authorizer else ""))
+        lines += [line for line in (evidence, _attr_line(body, "authorizer_id")) if line]
+    for name in extra_guards:
+        if (_extract_attr(body, name) or "").lower() == "true":
+            guards.append(name)
+            lines += [line for line in (_attr_line(body, name),) if line]
+    if guards:
+        return REQUIRED, guards, "; ".join(lines) or None
+    if value.upper() == "NONE" and evidence:
+        return ANONYMOUS, [], evidence
+    return UNKNOWN, [], None
+
+
 class TerraformAnalyzer:
     metadata = AnalyzerMetadata(
         name="terraform",
@@ -550,6 +591,10 @@ class TerraformAnalyzer:
         result = ScanResult(root=str(root))
         if not root.exists() or not root.is_dir():
             return result
+        # REST API (v1) methods become routes after the walk, once every
+        # aws_api_gateway_resource (path_part / parent_id) has been seen.
+        self._apigw_resources: dict[str, tuple[str, str]] = {}
+        self._apigw_methods: list[tuple[str, str, tuple[str, list[str], str | None], str, int]] = []
 
         for file_path in iter_repo_files(root, suffixes=_WALK_SUFFIXES, skip_dirs=SKIP_DIRS):
             if not _is_terraform_file(file_path):
@@ -574,8 +619,35 @@ class TerraformAnalyzer:
             self._extract_modules(content, relative, result)
             self._extract_data_sources(content, relative, result)
 
+        for resource_ref, http_method, auth, file, line in self._apigw_methods:
+            path = self._apigw_path(resource_ref)
+            if path is not None:
+                self._append_unique_route(
+                    result, path, http_method, file, line,
+                    auth=auth[0], guards=auth[1], guard_evidence=auth[2],
+                )
+
         result.languages.sort()
         return result
+
+    def _apigw_path(self, resource_ref: str) -> str | None:
+        """Full path of a REST API resource reference, or None when a parent
+        isn't a literal resource in this repo."""
+        parts: list[str] = []
+        ref = resource_ref.strip()
+        for _ in range(_APIGW_PATH_DEPTH):
+            if _APIGW_ROOT_REF.match(ref):
+                return "/" + "/".join(reversed(parts))
+            match = _APIGW_RESOURCE_REF.match(ref)
+            resource = self._apigw_resources.get(match.group(1)) if match else None
+            if resource is None:
+                return None
+            parent, path_part = resource
+            if not _APIGW_PATH_PART.match(path_part) or _TF_REFERENCE.match(path_part):
+                return None  # interpolated or computed
+            parts.append(path_part)
+            ref = parent.strip()
+        return None
 
     # ---------- Extractors ----------
 
@@ -761,6 +833,15 @@ class TerraformAnalyzer:
             self._append_unique_entrypoint(
                 result, f"{label}:{resource_name}", file, line, ev,
             )
+            # A function URL serves every method and path of the function.
+            auth, guards, evidence = _route_auth(body, "authorization_type")
+            self._append_unique_route(
+                result, "/", "ANY", file, line, auth=auth, guards=guards, guard_evidence=evidence,
+            )
+            return
+        if resource_type == "aws_api_gateway_resource":
+            parent = _extract_attr(body, "parent_id") or ""
+            self._apigw_resources.setdefault(resource_name, (parent, _extract_attr(body, "path_part") or ""))
             return
         if resource_type == "aws_api_gateway_method":
             http_method = (_extract_attr(body, "http_method") or "ANY").upper()
@@ -773,6 +854,10 @@ class TerraformAnalyzer:
                 self._append_unique_entrypoint(
                     result, f"apigw_method:{http_method}:{resource_name}", file, line, ev,
                 )
+            resource_id = _extract_attr(body, "resource_id")
+            if resource_id:
+                auth = _route_auth(body, "authorization", ("api_key_required",))
+                self._apigw_methods.append((resource_id, http_method, auth, file, line))
             return
         if resource_type == "aws_apigatewayv2_route":
             route_key = _extract_attr(body, "route_key") or ""
@@ -782,7 +867,11 @@ class TerraformAnalyzer:
                 parts = route_key.strip().split(maxsplit=1)
                 if len(parts) == 2:
                     method, path = parts[0].upper(), parts[1]
-                    self._append_unique_route(result, path, method, file, line)
+                    auth, guards, evidence = _route_auth(body, "authorization_type")
+                    self._append_unique_route(
+                        result, path, method, file, line,
+                        auth=auth, guards=guards, guard_evidence=evidence,
+                    )
                     if authorization_type == "NONE":
                         self._append_unique_entrypoint(
                             result, f"apigwv2_open:{resource_name}", file, line, ev,
@@ -924,11 +1013,29 @@ class TerraformAnalyzer:
     # ---------- Append helpers ----------
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int | None) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int | None,
+        *,
+        auth: str = UNKNOWN,
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> None:
+        # Route.auth / guards / guard_evidence (AttackMap#256): core trusts
+        # them over its own resolution; an older core ignores the fields. The
+        # apigw*_open / lambda_url_open entrypoint hints stay for one release.
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+        result.routes.append(
+            Route(
+                path=path, method=method, file=file, line=line,
+                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+            )
+        )
 
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
