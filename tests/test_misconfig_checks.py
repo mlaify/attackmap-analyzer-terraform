@@ -684,3 +684,48 @@ def test_old_core_gets_no_records_and_keeps_hints(tmp_path: Path, monkeypatch: p
     result = _scan(tmp_path, {"main.tf": 'resource "aws_s3_bucket_acl" "a" {\n  acl = "public-read"\n}\n'})
     assert result.cloud_misconfigs == []
     assert "s3_public_acl:a" in {h.hint for h in result.entrypoint_hints}
+
+
+_COMMENTED_TF = '''# Stray braces and quotes in comments: { "
+resource "aws_instance" "a" {
+  # TODO: drop the public IP {
+  // was "public
+  /* old: ingress { cidr = "0.0.0.0/0" */
+  associate_public_ip_address = true
+  user_data = <<-EOT
+    #!/bin/sh
+    echo '{' > /tmp/x "
+  EOT
+}
+
+resource "aws_db_instance" "db" {
+  storage_encrypted = false
+}
+
+# resource "aws_instance" "commented_out" {
+#   associate_public_ip_address = true
+# }
+
+resource "aws_instance" "b" {
+  associate_public_ip_address = true
+}
+'''
+
+
+def test_comments_strings_and_heredocs_do_not_swallow_later_blocks(tmp_path: Path) -> None:
+    records = {(m.kind, m.resource) for m in _records(tmp_path, _COMMENTED_TF)}
+    assert records == {
+        ("public_network_access", "aws_instance.a"),
+        ("unencrypted_storage", "aws_db_instance.db"),
+        ("public_network_access", "aws_instance.b"),
+    }
+
+
+def test_an_unterminated_block_does_not_hide_later_blocks(tmp_path: Path) -> None:
+    text = (
+        'resource "aws_instance" "broken" {\n  associate_public_ip_address = true\n\n'
+        'resource "aws_db_instance" "db" {\n  storage_encrypted = false\n}\n'
+    )
+    records = {(m.kind, m.resource) for m in _records(tmp_path, text)}
+    assert ("unencrypted_storage", "aws_db_instance.db") in records
+    assert ("public_network_access", "aws_instance.broken") in records

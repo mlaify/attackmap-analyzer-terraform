@@ -158,25 +158,85 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     return line
 
 
+def _skip_non_code(content: str, i: int) -> int | None:
+    """If a comment (``#``, ``//``, ``/* */``) or heredoc starts at ``i``,
+    the offset just past it; else None. Braces and quotes in them don't
+    count (a stray ``{`` in a comment used to swallow the rest of the file)."""
+    ch = content[i]
+    if ch == "#" or content.startswith("//", i):
+        end = content.find("\n", i)
+        return len(content) if end == -1 else end
+    if content.startswith("/*", i):
+        end = content.find("*/", i + 2)
+        return len(content) if end == -1 else end + 2
+    if content.startswith("<<", i):
+        heredoc = _HEREDOC_RE.match(content, i)
+        if heredoc:
+            terminator = re.compile(rf"^[ \t]*{re.escape(heredoc.group(1))}[ \t]*$", re.MULTILINE)
+            end = terminator.search(content, heredoc.end())
+            return len(content) if end is None else end.end()
+    return None
+
+
+def _brace_pairs(content: str) -> tuple[dict[int, int], bytearray]:
+    """One linear pass: the closing ``}`` of every code ``{``, and a mask of
+    the characters inside comments, heredocs and strings. Strings end at a
+    newline (HCL quoted strings are single-line), so a stray ``"`` can't
+    swallow the file either."""
+    closes: dict[int, int] = {}
+    ignored = bytearray(len(content))
+    stack: list[int] = []
+    i, n = 0, len(content)
+    while i < n:
+        ch = content[i]
+        if ch == '"':
+            j = i + 1
+            while j < n and content[j] not in '"\n':
+                j += 2 if content[j] == "\\" else 1
+            end = min(j + 1, n)
+            ignored[i:end] = b"\x01" * (end - i)
+            i = end
+            continue
+        skipped = _skip_non_code(content, i) if ch in "#/<" else None
+        if skipped is not None:
+            ignored[i:skipped] = b"\x01" * (skipped - i)
+            i = skipped
+            continue
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            closes[stack.pop()] = i
+        i += 1
+    return closes, ignored
+
+
 def _top_blocks(pattern: re.Pattern[str], content: str):
-    """``(match, body)`` for each block header ``pattern`` finds, scanning on
-    from the end of the previous block. Top-level blocks don't nest, and an
-    unterminated block ends the scan, so this stays linear (a ``finditer``
-    re-scanning every header inside an unterminated body was quadratic)."""
-    pos = 0
-    while True:
-        match = pattern.search(content, pos)
-        if match is None:
-            return
-        body, end = _block_body(content, match.end())
-        yield match, body
-        pos = max(end + 1, match.end())
+    """``(match, body)`` for each block header ``pattern`` finds outside
+    comments and strings. Top-level blocks don't nest, so headers inside a
+    terminated block are skipped. An unterminated block's body ends at the
+    next header, and scanning resumes after its own header, so one broken
+    block no longer hides the rest of the file. Linear overall."""
+    closes, ignored = _brace_pairs(content)
+    headers = [m for m in pattern.finditer(content) if not ignored[m.start()]]
+    resume = 0
+    for index, match in enumerate(headers):
+        if match.start() < resume:
+            continue
+        close = closes.get(match.end() - 1)
+        if close is None:
+            end = headers[index + 1].start() if index + 1 < len(headers) else len(content)
+            yield match, content[match.end():end]
+            resume = match.end()
+        else:
+            yield match, content[match.end():close]
+            resume = close + 1
 
 
 def _block_body(content: str, body_start: int) -> tuple[str, int]:
     """Return the body of a block whose `{` is at body_start-1, plus the offset
-    of the closing `}`. Tracks brace depth and string literals so nested
-    `ingress { ... }` blocks are included."""
+    of the closing `}`. Tracks brace depth, string literals, comments and
+    heredocs, so nested `ingress { ... }` blocks are included and a `{` in a
+    comment doesn't count."""
     depth = 1
     i = body_start
     in_string = False
@@ -191,6 +251,11 @@ def _block_body(content: str, body_start: int) -> tuple[str, int]:
             elif ch == '"':
                 in_string = False
         else:
+            if ch in "#/<":
+                skipped = _skip_non_code(content, i)
+                if skipped is not None:
+                    i = skipped
+                    continue
             if ch == '"':
                 in_string = True
             elif ch == "{":
@@ -203,19 +268,26 @@ def _block_body(content: str, body_start: int) -> tuple[str, int]:
     return content[body_start:i], i
 
 
-def _scan_text(text: str) -> tuple[list[int], list[bool]]:
+def _scan_text(text: str, *, heredocs: bool = True) -> tuple[list[int], list[bool]]:
     """Per-character brace depth and string mask for ``text``.
 
     ``depths[i]`` is the ``{ }`` nesting depth of the code around character
     ``i`` (an opening ``{`` and its matching ``}`` both carry the outer depth);
-    ``in_string[i]`` is True for characters of a ``"..."`` literal, quotes
-    included. Braces inside strings don't count."""
+    ``in_string[i]`` is True for characters of a ``"..."`` literal (quotes
+    included), a comment, or (with ``heredocs``) a heredoc body. Braces in
+    any of them don't count. Policy scanning passes ``heredocs=False`` to see
+    the JSON inside a heredoc."""
     depths = [0] * len(text)
     in_string = [False] * len(text)
     depth = 0
     inside = False
     escape = False
+    skip_to = 0
     for i, ch in enumerate(text):
+        if i < skip_to:
+            in_string[i] = True
+            depths[i] = depth
+            continue
         if inside:
             in_string[i] = True
             depths[i] = depth
@@ -226,6 +298,13 @@ def _scan_text(text: str) -> tuple[list[int], list[bool]]:
             elif ch == '"':
                 inside = False
             continue
+        if ch in "#/<" and (heredocs or ch != "<"):
+            skipped = _skip_non_code(text, i)
+            if skipped is not None:
+                skip_to = skipped
+                in_string[i] = True
+                depths[i] = depth
+                continue
         if ch == '"':
             inside = True
             in_string[i] = True
@@ -392,7 +471,7 @@ def _json_policy_statements(text: str) -> list[str]:
     (``jsonencode({...})``, heredoc JSON or a JSON string rendered as a
     heredoc). A statement is any ``{ ... }`` whose own keys include Effect,
     Action, NotAction, Principal or NotPrincipal (case-insensitive)."""
-    depths, in_string = _scan_text(text)
+    depths, in_string = _scan_text(text, heredocs=False)
     statements: list[str] = []
     for i, ch in enumerate(text):
         # Statements sit a few levels deep (jsonencode({ Statement = [{...}] })).
