@@ -510,3 +510,177 @@ def test_records_become_core_findings(tmp_path: Path) -> None:
     scan = analyze_repository(tmp_path, analyzers=[TerraformAnalyzer()])
     rule_ids = {f.rule_id for f in translate_recon(scan).findings}
     assert {"iac-module-unpinned", "unencrypted-storage"} <= rule_ids
+
+
+# ---------- Review round 1 ----------
+
+import subprocess
+import sys
+import time
+
+_RUN = "import sys; from attackmap_analyzer_terraform import TerraformAnalyzer; TerraformAnalyzer().analyze(sys.argv[1])"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'resource "aws_iam_policy" "p" {\n  policy = jsonencode(' + "{" * 100000 + ")\n}\n",
+        'resource "aws_instance" "x" {\n' * 30000,
+        "".join(f'module "m{i}" {{\n  source = "./m"\n}}\n' for i in range(40000)),
+        "".join(f'resource "aws_instance" "i{i}" {{\n  associate_public_ip_address = true\n}}\n' for i in range(20000)),
+        'resource "kubernetes_pod" "p" {\n' + "  a {\n" * 50000,
+    ],
+    ids=["nested-policy", "unterminated-resources", "many-modules", "many-records", "nested-blocks"],
+)
+def test_hostile_input_is_fast(tmp_path: Path, text: str) -> None:
+    import os
+
+    (tmp_path / "main.tf").write_text(text, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    start = time.monotonic()
+    proc = subprocess.run([sys.executable, "-c", _RUN, str(tmp_path)], env=env, timeout=60, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert time.monotonic() - start < 20  # each took 18 s to >90 s before
+
+
+def test_policy_statements_are_still_found_at_normal_depth(tmp_path: Path) -> None:
+    text = (
+        'resource "aws_iam_policy" "p" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Allow"\n      Action = "*"\n      Resource = "*"\n    }]\n  })\n}\n'
+    )
+    hints = {h.hint for h in _scan(tmp_path, {"main.tf": text}).auth_hints}
+    assert {"iam_wildcard_action:p", "iam_wildcard_resource:p"} <= hints
+
+
+def test_repeated_signals_are_deduplicated(tmp_path: Path) -> None:
+    text = 'module "m" {\n  source = "terraform-aws-modules/vpc/aws"\n}\n' * 3
+    result = _scan(tmp_path, {"main.tf": text})
+    assert [s.hint for s in result.service_hints] == ["module:m"]
+
+
+def test_duplicate_records_are_deduplicated(tmp_path: Path) -> None:
+    text = 'resource "aws_instance" "a" {\n  associate_public_ip_address = true\n}\n'
+    result = _scan(tmp_path, {"a.tf": text, "b.tf": text.replace('"a"', '"b"')})
+    assert len(result.cloud_misconfigs) == 2
+    again = TerraformAnalyzer()
+    first = again.analyze(tmp_path)
+    assert len(first.cloud_misconfigs) == 2  # per-result keys don't leak between runs
+
+
+def test_indexed_lb_refs_per_module_dir_and_dynamic_redirects(tmp_path: Path) -> None:
+    lb = 'resource "aws_lb" "this" {\n  count = 1\n  internal = %s\n}\n'
+    listener = (
+        'resource "aws_lb_listener" "%s" {\n  load_balancer_arn = aws_lb.this[0].arn\n  protocol = "HTTP"\n%s}\n'
+    )
+    forward = '  default_action {\n    type = "forward"\n  }\n'
+    dyn_redirect = '  dynamic "default_action" {\n    for_each = [1]\n    content {\n      type = "redirect"\n    }\n  }\n'
+    dyn_forward = dyn_redirect.replace("redirect", "forward")
+    computed = '  default_action {\n    type = var.action\n  }\n'
+    result = _scan(
+        tmp_path,
+        {
+            "internal/main.tf": lb % "true" + listener % ("a", forward),
+            "public/main.tf": lb % "false" + listener % ("b", forward) + listener % ("c", dyn_redirect)
+            + listener % ("d", computed) + listener % ("g", dyn_forward),
+            "computed/main.tf": lb % "var.internal" + listener % ("e", forward),
+            "unresolved/main.tf": listener.replace("aws_lb.this[0].arn", "var.lb_arn") % ("f", forward),
+        },
+    )
+    records = {m.resource: m.confidence for m in result.cloud_misconfigs if m.kind == "plaintext_listener"}
+    assert records == {"aws_lb_listener.b": 0.8, "aws_lb_listener.g": 0.8, "aws_lb_listener.f": 0.6}
+
+
+@pytest.mark.parametrize(
+    "name, value, hardcoded",
+    [
+        ("db_password", "hunter2!x", True),
+        ("api_token", "sk-live-1234567", True),
+        ("ssh_public_key", "ssh-rsa AAAAB3NzaC1yc2E user@host", False),
+        ("db_password", "postgres://app:s3cretpw@db:5432/app", True),
+        ("token_url", "https://auth.example.com/token", False),
+        ("secret_key_id", "UserId", False),
+        ("password_mode", "off", False),
+        ("master_password", "master", False),
+        ("admin_username", "administrator1", False),
+        ("db_password", "abc12", False),
+    ],
+)
+def test_secret_default_value_shape(tmp_path: Path, name: str, value: str, hardcoded: bool) -> None:
+    text = f'variable "{name}" {{\n  sensitive = true\n  default = "{value}"\n}}\n'
+    (hint,) = _scan(tmp_path, {"variables.tf": text}).secret_hints
+    assert (hint.kind == "hardcoded") is hardcoded
+    if hardcoded:
+        assert value not in (hint.evidence_text or "")
+
+
+@pytest.mark.parametrize(
+    "rule, kinds",
+    [
+        ('api_groups = [""]\n    resources = ["events"]\n    verbs = ["*"]', []),
+        ('api_groups = ["metrics.k8s.io"]\n    resources = ["*"]\n    verbs = ["get", "list"]', []),
+        ('api_groups = [""]\n    resources = ["pods"]\n    verbs = ["*"]', ["rbac_wildcard"]),
+        ('api_groups = [""]\n    resources = ["secrets"]\n    resource_names = ["tls"]\n    verbs = ["get"]', []),
+        ('api_groups = [""]\n    resources = ["secrets"]\n    verbs = ["get"]', ["rbac_secret_access"]),
+    ],
+)
+def test_kubernetes_provider_rbac_filters(tmp_path: Path, rule: str, kinds: list) -> None:
+    text = f'resource "kubernetes_cluster_role" "r" {{\n  rule {{\n    {rule}\n  }}\n}}\n'
+    assert [m.kind for m in _records(tmp_path, text)] == kinds
+
+
+@pytest.mark.parametrize("role, count", [("system:basic-user", 0), ("view", 0), ("edit", 1), ("cluster-admin", 1)])
+def test_kubernetes_provider_broad_group_binding_needs_admin_role(tmp_path: Path, role: str, count: int) -> None:
+    text = (
+        f'resource "kubernetes_cluster_role_binding" "b" {{\n  role_ref {{\n    name = "{role}"\n  }}\n'
+        '  subject {\n    kind = "Group"\n    name = "system:authenticated"\n  }\n}\n'
+    )
+    assert len(_records(tmp_path, text)) == count
+
+
+@pytest.mark.parametrize(
+    "annotation, exposed",
+    [
+        ('"service.beta.kubernetes.io/aws-load-balancer-internal" = "true"', False),
+        ('"service.beta.kubernetes.io/aws-load-balancer-internal" = "false"', True),
+        ('"service.beta.kubernetes.io/aws-load-balancer-scheme" = "internet-facing"', True),
+        ('"service.beta.kubernetes.io/aws-load-balancer-scheme" = "internal"', False),
+        ('"service.beta.kubernetes.io/azure-load-balancer-internal" = var.internal', False),
+    ],
+)
+def test_kubernetes_provider_internal_lb_annotations(tmp_path: Path, annotation: str, exposed: bool) -> None:
+    text = (
+        f'resource "kubernetes_service" "s" {{\n  metadata {{\n    annotations = {{\n      {annotation}\n    }}\n  }}\n'
+        '  spec {\n    type = "LoadBalancer"\n  }\n}\n'
+    )
+    assert bool(_records(tmp_path, text, "exposed_service")) is exposed
+
+
+@pytest.mark.parametrize("path, severity", [("/etc/ssl/certs", "low"), ("/etc/letsencrypt", "low"), ("/dev/dri", "low"),
+                                            ("/dev/log", "low"), ("/etc/kubernetes", "high")])
+def test_kubernetes_provider_benign_host_paths(tmp_path: Path, path: str, severity: str) -> None:
+    text = f'resource "kubernetes_pod" "p" {{\n  spec {{\n    volume {{\n      host_path {{\n        path = "{path}"\n      }}\n    }}\n  }}\n}}\n'
+    assert [m.severity for m in _records(tmp_path, text, "host_path_mount")] == [severity]
+
+
+def test_v2_default_route_on_http_and_websocket_apis(tmp_path: Path) -> None:
+    text = (
+        'resource "aws_apigatewayv2_api" "http" {\n  protocol_type = "HTTP"\n}\n'
+        'resource "aws_apigatewayv2_api" "ws" {\n  protocol_type = "WEBSOCKET"\n}\n'
+        'resource "aws_apigatewayv2_route" "catch_all" {\n  api_id = aws_apigatewayv2_api.http.id\n  route_key = "$default"\n}\n'
+        'resource "aws_apigatewayv2_route" "guarded" {\n  api_id = aws_apigatewayv2_api.http.id\n  route_key = "$default"\n'
+        '  authorization_type = "JWT"\n}\n'
+        'resource "aws_apigatewayv2_route" "ws_default" {\n  api_id = aws_apigatewayv2_api.ws.id\n  route_key = "$default"\n}\n'
+    )
+    result = _scan(tmp_path, {"main.tf": text})
+    records = [m.resource for m in result.cloud_misconfigs if m.kind == "api_no_authorizer"]
+    assert records == ["aws_apigatewayv2_route.catch_all"]
+    assert {(r.path, r.method) for r in result.routes} == {("/{proxy+}", "ANY")}
+
+
+def test_old_core_gets_no_records_and_keeps_hints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from attackmap_analyzer_terraform import analyzer
+
+    monkeypatch.setattr(analyzer, "_CLOUD_RECORDS", False)
+    result = _scan(tmp_path, {"main.tf": 'resource "aws_s3_bucket_acl" "a" {\n  acl = "public-read"\n}\n'})
+    assert result.cloud_misconfigs == []
+    assert "s3_public_acl:a" in {h.hint for h in result.entrypoint_hints}

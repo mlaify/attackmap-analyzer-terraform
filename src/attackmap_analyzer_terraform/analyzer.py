@@ -42,7 +42,9 @@ import posixpath
 import re
 from pathlib import Path
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, line_of, read_source, rel
+from bisect import bisect_right
+
+from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
 
 from .contracts import (
     AnalyzerMetadata,
@@ -67,6 +69,48 @@ SKIP_DIRS = DEFAULT_SKIP_DIRS | {".terraform"}
 # narrow with ``_is_terraform_file``.
 _WALK_SUFFIXES = {".tf", ".tfvars", ".json"}
 _SNIPPET_MAX_CHARS = 160
+
+
+# ---------- Linear-time bookkeeping (hostile input) ----------
+
+# Dedup keys per result: a linear `any(...)` scan per append is quadratic on
+# a file with tens of thousands of blocks. Keyed by id(); the result object
+# is kept to rule out id reuse, and dropped at the end of `analyze`.
+_SEEN: dict[int, tuple[object, set]] = {}
+
+# Feature detection: a core older than AttackMap#334 neither exports the
+# record nor has the field, and ignores records. The pre-existing exposure
+# hints (s3_public_*, rds_publicly_accessible, apigw*_open, ...) are emitted
+# on every core either way.
+_CLOUD_RECORDS = CloudMisconfig is not None and "cloud_misconfigs" in getattr(ScanResult, "model_fields", {})
+
+
+def _first_seen(owner: object, key: tuple) -> bool:
+    entry = _SEEN.get(id(owner))
+    if entry is None or entry[0] is not owner:
+        entry = _SEEN[id(owner)] = (owner, set())
+    if key in entry[1]:
+        return False
+    entry[1].add(key)
+    return True
+
+
+# Line starts of the file being analyzed. `attackmap.sdk.line_of` recounts
+# newlines from the top on every call (quadratic for many blocks); files are
+# analyzed one at a time, so one cached index is enough.
+_LINES: list = [None, [0]]
+
+
+def line_of(content: str, offset: int) -> int:
+    """1-indexed line of ``offset`` (same numbering as `attackmap.sdk.line_of`)."""
+    if _LINES[0] is not content:
+        starts = [0]
+        index = content.find("\n")
+        while index != -1:
+            starts.append(index + 1)
+            index = content.find("\n", index + 1)
+        _LINES[0], _LINES[1] = content, starts
+    return bisect_right(_LINES[1], max(offset, 0))
 
 # ---------- Patterns ----------
 
@@ -112,6 +156,21 @@ def _line_snippet(content: str, offset: int, *, max_chars: int = _SNIPPET_MAX_CH
     if len(line) > max_chars:
         line = line[: max_chars - 1] + "…"
     return line
+
+
+def _top_blocks(pattern: re.Pattern[str], content: str):
+    """``(match, body)`` for each block header ``pattern`` finds, scanning on
+    from the end of the previous block. Top-level blocks don't nest, and an
+    unterminated block ends the scan, so this stays linear (a ``finditer``
+    re-scanning every header inside an unterminated body was quadratic)."""
+    pos = 0
+    while True:
+        match = pattern.search(content, pos)
+        if match is None:
+            return
+        body, end = _block_body(content, match.end())
+        yield match, body
+        pos = max(end + 1, match.end())
 
 
 def _block_body(content: str, body_start: int) -> tuple[str, int]:
@@ -325,15 +384,21 @@ _STATEMENT_KEY_RE = re.compile(
 )
 
 
+_POLICY_MAX_DEPTH = 8
+
+
 def _json_policy_statements(text: str) -> list[str]:
     """Bodies of IAM policy statement objects found anywhere in ``text``
     (``jsonencode({...})``, heredoc JSON or a JSON string rendered as a
     heredoc). A statement is any ``{ ... }`` whose own keys include Effect,
     Action, NotAction, Principal or NotPrincipal (case-insensitive)."""
-    _, in_string = _scan_text(text)
+    depths, in_string = _scan_text(text)
     statements: list[str] = []
     for i, ch in enumerate(text):
-        if ch != "{" or in_string[i]:
+        # Statements sit a few levels deep (jsonencode({ Statement = [{...}] })).
+        # Bounding the depth keeps this linear: every `{` used to re-scan its
+        # whole body, quadratic in nesting.
+        if ch != "{" or in_string[i] or depths[i] > _POLICY_MAX_DEPTH:
             continue
         inner, _ = _block_body(text, i + 1)
         if _STATEMENT_KEY_RE.search(_top_level(inner)):
@@ -455,6 +520,28 @@ def _tfvars_key_is_secret(key: str) -> bool:
 # `default = "literal"` in a variable block (heredoc / list / map defaults are
 # not credentials).
 _VARIABLE_STRING_DEFAULT_RE = re.compile(r'^[ \t]*default[ \t]*=[ \t]*"((?:[^"\\\n]|\\.)*)"', re.MULTILINE)
+
+
+_PUBLIC_KEY_PREFIXES = ("ssh-rsa ", "ssh-ed25519 ", "ssh-dss ", "ecdsa-sha2-", "sk-ssh-", "-----BEGIN PUBLIC KEY", "-----BEGIN CERTIFICATE")
+_URL_WITH_PASSWORD_RE = re.compile(r"://[^/@\s:]{1,256}:[^/@\s]{1,256}@")
+_PLAIN_WORD_RE = re.compile(r"[A-Za-z]{1,12}")
+_IDENTIFIER_NAME_RE = re.compile(r"user|login|account|email|owner", re.IGNORECASE)
+_CREDENTIAL_NAME_RE = re.compile(r"pass|pwd|secret|token|private", re.IGNORECASE)
+_MIN_CREDENTIAL_LEN = 6
+
+
+def _credential_shaped_default(name: str, value: str) -> bool:
+    """Whether a secret variable's literal default looks like a credential
+    rather than a public key, URL, username or short setting (`off`,
+    `UserId`, `master`)."""
+    value = value.strip()
+    if not value or _looks_like_reference(value) or value.startswith(_PUBLIC_KEY_PREFIXES):
+        return False
+    if "://" in value:
+        return bool(_URL_WITH_PASSWORD_RE.search(value))  # only a URL with an embedded password
+    if len(value) < _MIN_CREDENTIAL_LEN or _PLAIN_WORD_RE.fullmatch(value):
+        return False
+    return not (_IDENTIFIER_NAME_RE.search(name) and not _CREDENTIAL_NAME_RE.search(name))
 
 
 def _looks_like_reference(value: str) -> bool:
@@ -676,8 +763,91 @@ _TF_K8S_SERVICES = frozenset({"kubernetes_service", "kubernetes_service_v1"})
 _BROAD_K8S_GROUPS = frozenset({"system:authenticated", "system:unauthenticated", "system:anonymous"})
 
 
+# `aws_lb.x.arn`, `aws_lb.x[0].arn`, `aws_lb.x["a"].arn`
+_LB_REF_RE = re.compile(r'^aws_(?:lb|alb)\.([\w-]+)(?:\[[^\]\n]{0,64}\])?\.(?:arn|id)$')
+
+
+_V2_API_REF_RE = re.compile(r'^aws_apigatewayv2_api\.([\w-]+)(?:\[[^\]\n]{0,64}\])?\.id$')
+_ACTION_TYPE_RE = re.compile(r"[\w-]{1,64}")
+
+
+def _action_type(block: str) -> str:
+    """Lower-cased literal `type` of a `default_action` (or the `content` of
+    a `dynamic "default_action"`), or ``?`` when it is computed."""
+    content = _sub_blocks(block, "content")
+    raw = _extract_attr(content[0] if content else block, "type")
+    if raw is None:
+        return "?" if content or "for_each" in block else ""
+    value = raw.strip()
+    if not _ACTION_TYPE_RE.fullmatch(value):
+        return "?"
+    return value.lower()
+
+
+# Read-only system data under the sensitive trees: CA bundles, TLS certs,
+# time zone, the syslog socket, GPUs. Same list as attackmap-analyzer-iac.
+_BENIGN_HOST_PATHS = (
+    "/etc/ssl", "/etc/pki", "/etc/ca-certificates", "/etc/localtime", "/etc/timezone", "/etc/machine-id",
+    "/etc/os-release", "/etc/letsencrypt", "/dev/log", "/dev/dri", "/usr/share/ca-certificates",
+)
+
+# Kubernetes RBAC: same rules as attackmap-analyzer-iac (records.py).
+_SENSITIVE_API_GROUPS = frozenset({
+    "", "*", "apps", "batch", "extensions", "policy", "networking.k8s.io", "rbac.authorization.k8s.io",
+    "admissionregistration.k8s.io", "certificates.k8s.io", "apiextensions.k8s.io",
+})
+_SENSITIVE_RESOURCES = frozenset({
+    "*", "secrets", "pods", "pods/exec", "pods/attach", "pods/ephemeralcontainers", "deployments", "daemonsets",
+    "statefulsets", "replicasets", "jobs", "cronjobs", "replicationcontrollers", "serviceaccounts",
+    "serviceaccounts/token", "roles", "rolebindings", "clusterroles", "clusterrolebindings", "nodes",
+    "nodes/proxy", "persistentvolumes", "mutatingwebhookconfigurations", "validatingwebhookconfigurations",
+    "customresourcedefinitions", "certificatesigningrequests", "certificatesigningrequests/approval",
+    "configmaps", "namespaces", "networkpolicies",
+})
+_ADMIN_LIKE_ROLES = frozenset({"cluster-admin", "admin", "edit"})
+_INTERNAL_LB_ANNOTATIONS = {
+    "aws-load-balancer-internal": {"true", "0.0.0.0/0"},
+    "aws-load-balancer-scheme": {"internal"},
+    "azure-load-balancer-internal": {"true"},
+    "oci-load-balancer-internal": {"true"},
+    "openstack-internal-load-balancer": {"true"},
+    "load-balancer-type": {"internal"},
+    "ibm-load-balancer-cloud-provider-ip-type": {"private"},
+    "alibaba-cloud-loadbalancer-address-type": {"intranet"},
+}
+_ANNOTATION_PAIR_RE = re.compile(r'"([^"\n]{1,253})"[ \t]*[=:][ \t]*("[^"\n]{0,253}"|[^\s,}]{1,253})')
+
+
+def _rbac_wildcard(groups: set[str] | None, verbs: set[str], resources: set[str]) -> bool:
+    """A `*` on a control-plane API group, for every resource or a sensitive
+    one (not `verbs = ["*"]` on `events` or `metrics.k8s.io`)."""
+    if "*" not in verbs and "*" not in resources:
+        return False
+    if groups is not None and not groups & _SENSITIVE_API_GROUPS:
+        return False
+    return "*" in resources or bool(resources & _SENSITIVE_RESOURCES)
+
+
+def _internal_lb(annotations: str) -> bool:
+    """A cloud's internal-LB annotation set to an internal value (an explicit
+    `"false"` / `internet-facing` is external; a computed value counts as
+    internal, i.e. not reported)."""
+    for key, raw in _ANNOTATION_PAIR_RE.findall(annotations):
+        accepted = _INTERNAL_LB_ANNOTATIONS.get(key.rsplit("/", 1)[-1].lower())
+        if accepted is None:
+            continue
+        value = raw.strip().strip('"').lower()
+        if not raw.startswith('"') and value not in {"true", "false"}:
+            return True  # var.x / local.y
+        if value in accepted or "${" in value:
+            return True
+    return False
+
+
 def _host_path_severity(path: str) -> str:
     normalized = posixpath.normpath(path) if path else path
+    if any(normalized == p or normalized.startswith(p + "/") for p in _BENIGN_HOST_PATHS):
+        return "low"
     if normalized == "/" or any(normalized == p or normalized.startswith(p + "/") for p in _SENSITIVE_HOST_PATHS):
         return "high"
     return "low"
@@ -768,8 +938,12 @@ class TerraformAnalyzer:
         self._apigw_methods: list[tuple[str, str, tuple[str, list[str], str | None], str, int]] = []
         # HTTP listeners are judged after the walk, once every aws_lb's
         # `internal` flag has been seen.
-        self._lb_internal: dict[str, bool] = {}
+        # (module directory, aws_lb name) -> internal? (None: computed value)
+        self._lb_internal: dict[tuple[str, str], bool | None] = {}
         self._http_listeners: list[tuple[str, str, str, int, str, str, str | None]] = []
+        # API Gateway v2 `$default` routes, judged once every API's protocol is known.
+        self._v2_protocols: dict[tuple[str, str], str | None] = {}
+        self._v2_default_routes: list[tuple[str, str, str, str, int, str | None]] = []
         # Context of the resource being dispatched: for_each/count and, for a
         # file inside a local module, the module blocks that call it.
         self._context: str | None = None
@@ -802,6 +976,7 @@ class TerraformAnalyzer:
             self._extract_data_sources(content, relative, result)
 
         self._emit_http_listeners(result)
+        self._emit_v2_default_routes(result)
         for resource_ref, http_method, auth, file, line in self._apigw_methods:
             path = self._apigw_path(resource_ref)
             if path is not None:
@@ -811,6 +986,7 @@ class TerraformAnalyzer:
                 )
 
         result.languages.sort()
+        _SEEN.pop(id(result), None)
         return result
 
     def _apigw_path(self, resource_ref: str) -> str | None:
@@ -844,9 +1020,8 @@ class TerraformAnalyzer:
             )
 
     def _extract_resources(self, content: str, relative: str, result: ScanResult) -> None:
-        for match in RESOURCE_BLOCK_PATTERN.finditer(content):
+        for match, body in _top_blocks(RESOURCE_BLOCK_PATTERN, content):
             resource_type, resource_name = match.group(1), match.group(2)
-            body, _ = _block_body(content, match.end())
             line = line_of(content, match.start())
             self._dispatch_with_context(
                 resource_type, resource_name, body, relative, line,
@@ -890,8 +1065,7 @@ class TerraformAnalyzer:
         return self._body_line + body.count("\n", 0, match.start()) if match else default
 
     def _extract_variables(self, content: str, relative: str, result: ScanResult) -> None:
-        for match in VARIABLE_BLOCK_PATTERN.finditer(content):
-            body, _ = _block_body(content, match.end())
+        for match, body in _top_blocks(VARIABLE_BLOCK_PATTERN, content):
             self._handle_variable(
                 match.group(1), body, relative,
                 line_of(content, match.start()),
@@ -900,8 +1074,7 @@ class TerraformAnalyzer:
             )
 
     def _extract_modules(self, content: str, relative: str, result: ScanResult) -> None:
-        for match in MODULE_BLOCK_PATTERN.finditer(content):
-            body, _ = _block_body(content, match.end())
+        for match, body in _top_blocks(MODULE_BLOCK_PATTERN, content):
             self._handle_module(
                 match.group(1), body, relative, line_of(content, match.start()), result, body_line=line_of(content, match.start()),
             )
@@ -912,17 +1085,18 @@ class TerraformAnalyzer:
         ``module.<name> (<caller file>:<line>)`` for every block calling it,
         so resources found in that directory are attributed to their caller."""
         callers: dict[str, list[str]] = {}
+        seen: set[tuple[str, str]] = set()
         for file_path, relative, content in files:
             if file_path.suffix != ".tf":
                 continue
-            for match in MODULE_BLOCK_PATTERN.finditer(content):
-                body, _ = _block_body(content, match.end())
+            for match, body in _top_blocks(MODULE_BLOCK_PATTERN, content):
                 target = _local_module_dir(relative, _extract_attr(body, "source") or "")
                 if target is None:
                     continue
                 label = f"module.{match.group(1)} ({relative}:{line_of(content, match.start())})"
                 bucket = callers.setdefault(target, [])
-                if label not in bucket:
+                if (target, label) not in seen:
+                    seen.add((target, label))
                     bucket.append(label)
         return callers
 
@@ -950,8 +1124,7 @@ class TerraformAnalyzer:
         )
 
     def _extract_data_sources(self, content: str, relative: str, result: ScanResult) -> None:
-        for match in DATA_BLOCK_PATTERN.finditer(content):
-            body, _ = _block_body(content, match.end())
+        for match, body in _top_blocks(DATA_BLOCK_PATTERN, content):
             self._handle_data_source(
                 match.group(1), match.group(2), body, relative,
                 line_of(content, match.start()),
@@ -1045,7 +1218,7 @@ class TerraformAnalyzer:
         # A literal string `default` on a secret variable is a credential
         # committed to the repo (#4); a bare declaration only names one.
         default = _VARIABLE_STRING_DEFAULT_RE.search(_top_level(body))
-        if default and default.group(1).strip() and not _looks_like_reference(default.group(1)) and (
+        if default and _credential_shaped_default(var_name, default.group(1)) and (
             sensitive or _tfvars_key_is_secret(var_name)
         ):
             self._append_unique_secret(
@@ -1164,6 +1337,15 @@ class TerraformAnalyzer:
         if resource_type == "aws_apigatewayv2_route":
             route_key = _extract_attr(body, "route_key") or ""
             authorization_type = (_extract_attr(body, "authorization_type") or "").upper()
+            if route_key.strip() == "$default":
+                # The catch-all route: on an HTTP API it serves every method
+                # and path no other route matches. A WebSocket API has a
+                # `$default` too, which can't take an authorizer, so the API's
+                # protocol is resolved after the walk.
+                self._v2_default_routes.append(
+                    (resource, _extract_attr(body, "api_id") or "", body, file, line, self._context)
+                )
+                return
             if route_key:
                 # route_key is "GET /users" or "POST /things" — split into method + path.
                 parts = route_key.strip().split(maxsplit=1)
@@ -1190,8 +1372,14 @@ class TerraformAnalyzer:
                             escalation="anyone on the internet can call the integration behind this route",
                         )
             return
+        if resource_type == "aws_apigatewayv2_api":
+            protocol = (_extract_attr(body, "protocol_type") or "").strip().upper()
+            self._v2_protocols[(_file_dir(file), resource_name)] = protocol if protocol in {"HTTP", "WEBSOCKET"} else None
         if resource_type in {"aws_lb", "aws_alb"}:
-            self._lb_internal[resource_name] = _is_true(body, "internal")
+            internal = (_extract_attr(body, "internal") or "false").strip().lower()
+            self._lb_internal[(_file_dir(file), resource_name)] = (
+                True if internal == "true" else False if internal == "false" else None
+            )
         if resource_type in {"aws_lb", "aws_alb", "aws_cloudfront_distribution"}:
             self._append_unique_entrypoint(
                 result, f"{resource_type}:{resource_name}", file, line, ev,
@@ -1383,9 +1571,9 @@ class TerraformAnalyzer:
             protocol = (_extract_attr(body, "protocol") or "").upper()
             if protocol != "HTTP":
                 return
-            actions = [(_extract_attr(a, "type") or "").lower() for a in _sub_blocks(body, "default_action")]
-            if "redirect" in actions:
-                return
+            actions = [_action_type(a) for a in _sub_blocks(body, "default_action")]
+            if "redirect" in actions or "?" in actions:
+                return  # redirects, or a computed type that may be one
             lb_ref = _extract_attr(body, "load_balancer_arn") or ""
             self._http_listeners.append(
                 (resource, lb_ref, file, self._attr_lineno(body, "protocol", line), _attr_line(body, "protocol") or 'protocol = "HTTP"',
@@ -1477,7 +1665,7 @@ class TerraformAnalyzer:
             svc_type = _extract_attr(spec, "type") or ""
             if svc_type in {"LoadBalancer", "NodePort"} and _attr_value(_top_level(spec), "load_balancer_source_ranges") is None:
                 annotations = _attr_value(next(iter(_sub_blocks(body, "metadata")), ""), "annotations") or ""
-                if "internal" not in annotations.lower():
+                if not _internal_lb(annotations):
                     emit(
                         "exposed_service", "type", f'type = "{svc_type}" with no load_balancer_source_ranges',
                         severity="low", confidence=0.7,
@@ -1541,7 +1729,9 @@ class TerraformAnalyzer:
             top = _top_level(rule)
             verbs = {v.lower() for v in _string_list(_attr_value(top, "verbs"))}
             resources = {r.lower() for r in _string_list(_attr_value(top, "resources"))}
-            if "*" in verbs or "*" in resources:
+            groups_value = _attr_value(top, "api_groups")
+            groups = None if groups_value is None else set(_string_list(groups_value))
+            if _rbac_wildcard(groups, verbs, resources):
                 emit("rbac_wildcard", "verbs", at=body.find(rule), evidence=f"rule verbs={sorted(verbs)} resources={sorted(resources)}",
                      severity="high" if cluster else "medium", confidence=0.9,
                      escalation="the role grants every verb or resource, including secrets and RBAC objects")
@@ -1551,7 +1741,9 @@ class TerraformAnalyzer:
                 emit("rbac_escalation", "verbs", at=body.find(rule), evidence=f"rule verbs={sorted(verbs)} resources={sorted(resources)}",
                      severity="high", confidence=0.85,
                      escalation="a subject bound to this role can grant itself more permissions or run commands in other pods")
-            elif "secrets" in resources and verbs & {"get", "list", "watch"}:
+            elif "secrets" in resources and verbs & {"get", "list", "watch"} and not _string_list(
+                _attr_value(top, "resource_names")
+            ):  # resource_names narrows it to named Secrets
                 emit("rbac_secret_access", "verbs", at=body.find(rule), evidence=f"rule verbs={sorted(verbs)} resources=[secrets]",
                      severity="medium" if cluster else "low", confidence=0.8,
                      escalation="a subject bound to this role can read Secret values (service-account tokens, credentials)")
@@ -1562,20 +1754,46 @@ class TerraformAnalyzer:
         role = _extract_attr(role_ref, "name") or ""
         subjects = [(_extract_attr(s, "kind") or "", _extract_attr(s, "name") or "") for s in _sub_blocks(body, "subject")]
         broad = [name for _, name in subjects if name in _BROAD_K8S_GROUPS]
-        if role == "cluster-admin" or broad:
+        # system:authenticated bound to system:basic-user and the like is the
+        # default; only an admin-like role makes it a takeover.
+        if role == "cluster-admin" or (broad and role in _ADMIN_LIKE_ROLES):
             who = ", ".join(f"{k}/{n}" for k, n in subjects) or "subjects"
             emit("cluster_admin_binding", "name", f"role_ref {role or '?'} bound to {who}", severity="high", confidence=0.9,
                  escalation="every bound subject (and any pod running as it) has full control of the cluster")
 
+    def _emit_v2_default_routes(self, result: ScanResult) -> None:
+        for resource, api_ref, body, file, line, context in self._v2_default_routes:
+            match = _V2_API_REF_RE.match(api_ref.strip())
+            if match is None or self._v2_protocols.get((_file_dir(file), match.group(1))) != "HTTP":
+                continue  # WebSocket API, or an API we can't resolve
+            auth, guards, evidence = _route_auth(body, "authorization_type")
+            self._append_unique_route(
+                result, "/{proxy+}", "ANY", file, line, auth=auth, guards=guards, guard_evidence=evidence,
+            )
+            raw_auth = _extract_attr(body, "authorization_type")
+            if raw_auth is None or raw_auth.strip().upper() == "NONE":
+                self._body_line = None
+                self._append_misconfig(
+                    result, "api_no_authorizer", resource, "aws", file, line,
+                    "catch-all $default route with "
+                    + ('authorization_type = "NONE"' if raw_auth else "no authorization_type (defaults to NONE)"),
+                    severity="medium", confidence=0.85 if raw_auth else 0.7,
+                    escalation="every method and path no other route matches reaches the default integration unauthenticated",
+                    context=context,
+                )
+
     def _emit_http_listeners(self, result: ScanResult) -> None:
         for resource, lb_ref, file, line, evidence, action, context in self._http_listeners:
-            match = re.match(r"^aws_(?:lb|alb)\.([\w-]+)\.(?:arn|id)$", lb_ref.strip())
-            if match and self._lb_internal.get(match.group(1)):
-                continue  # internal load balancer
+            match = _LB_REF_RE.match(lb_ref.strip())
+            internal = self._lb_internal.get((_file_dir(file), match.group(1))) if match else False
+            if internal is not False:
+                continue  # internal, or `internal` is computed
             self._append_misconfig(
                 result, "plaintext_listener", resource, "aws", file, line,
                 f"{evidence} with no redirect to HTTPS",
-                severity="low" if action == "fixed-response" else "medium", confidence=0.8,
+                severity="low" if action == "fixed-response" else "medium",
+                # A load balancer we couldn't resolve (var./module output) may be internal.
+                confidence=0.8 if match else 0.6,
                 escalation="traffic (cookies, tokens, form posts) crosses the network in clear text",
                 context=context,
             )
@@ -1637,10 +1855,9 @@ class TerraformAnalyzer:
     ) -> None:
         """One `CloudMisconfig` per (kind, file, line, resource). ``context``
         defaults to the dispatched resource's for_each/count and module."""
-        if CloudMisconfig is None:
+        if not _CLOUD_RECORDS:
             return  # AttackMap core older than the CloudMisconfig contract
-        key = (kind, file, line, resource)
-        if any((m.kind, m.file, m.line, m.resource) == key for m in result.cloud_misconfigs):
+        if not _first_seen(result, ("misconfig", kind, file, line, resource, evidence)):
             return
         result.cloud_misconfigs.append(
             CloudMisconfig(
@@ -1669,7 +1886,7 @@ class TerraformAnalyzer:
         # them over its own resolution; an older core ignores the fields. The
         # apigw*_open / lambda_url_open entrypoint hints stay for one release.
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if not _first_seen(result, ("routes", *key)):
             return
         result.routes.append(
             Route(
@@ -1681,14 +1898,14 @@ class TerraformAnalyzer:
     @staticmethod
     def _append_unique_database(result: ScanResult, kind: str, file: str, line: int | None, evidence: str | None) -> None:
         key = (kind, file)
-        if any((item.kind, item.file) == key for item in result.databases):
+        if not _first_seen(result, ("databases", *key)):
             return
         result.databases.append(DatabaseHint(kind=kind, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
     def _append_unique_auth(result: ScanResult, hint: str, file: str, line: int | None, evidence: str | None, confidence: float) -> None:
         key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.auth_hints):
+        if not _first_seen(result, ("auth_hints", *key)):
             return
         result.auth_hints.append(AuthHint(hint=hint, file=file, line=line, evidence_text=evidence, confidence=confidence))
 
@@ -1703,7 +1920,7 @@ class TerraformAnalyzer:
         kind: str | None = None,
     ) -> None:
         key = (name, file)
-        if any((item.name, item.file) == key for item in result.secret_hints):
+        if not _first_seen(result, ("secret_hints", *key)):
             return
         extra = {"kind": kind} if kind is not None else {}
         result.secret_hints.append(
@@ -1713,28 +1930,28 @@ class TerraformAnalyzer:
     @staticmethod
     def _append_unique_external(result: ScanResult, target: str, file: str, line: int | None, evidence: str | None) -> None:
         key = (target, file)
-        if any((item.target, item.file) == key for item in result.external_calls):
+        if not _first_seen(result, ("external_calls", *key)):
             return
         result.external_calls.append(ExternalCall(target=target, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
     def _append_unique_framework(result: ScanResult, hint: str, file: str, line: int | None, evidence: str | None) -> None:
         key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.framework_hints):
+        if not _first_seen(result, ("framework_hints", *key)):
             return
         result.framework_hints.append(FrameworkHint(hint=hint, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
     def _append_unique_entrypoint(result: ScanResult, hint: str, file: str, line: int | None, evidence: str | None) -> None:
         key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.entrypoint_hints):
+        if not _first_seen(result, ("entrypoint_hints", *key)):
             return
         result.entrypoint_hints.append(EntrypointHint(hint=hint, file=file, line=line, evidence_text=evidence))
 
     @staticmethod
     def _append_unique_service(result: ScanResult, hint: str, file: str) -> None:
         key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.service_hints):
+        if not _first_seen(result, ("service_hints", *key)):
             return
         result.service_hints.append(ServiceHint(hint=hint, file=file))
 
