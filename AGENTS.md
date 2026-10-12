@@ -24,13 +24,14 @@ Terraform / HCL infrastructure-as-code coverage:
 - **IAM wildcards**: Allow statements in `aws_iam_*_policy` / `aws_iam_role` (trust + inline) bodies (`jsonencode`, heredoc JSON; keys case-insensitive) and `data "aws_iam_policy_document"` `statement { }` blocks → `iam_wildcard_action` (`Action "*"`), `iam_wildcard_resource` (`Resource "*"`), `iam_wildcard_principal` (`Principal "*"` with no `Condition`). Deny statements are ignored. Service wildcards such as `s3:*` are not flagged.
 - **Terraform JSON**: `.tf.json` is parsed with `json`; each block is rendered back to HCL and routed through the same handlers as `.tf` (identical signals), with `file:line` pointing at the JSON source.
 - **API Gateway v2 routes**: `route_key = "POST /charges"` → `Route` with method+path
+- **Misconfigurations** (`CloudMisconfig` records, #4): unpinned module sources, public IPs / endpoints / Azure public network access, public EKS API endpoints, HTTP listeners without a redirect, API Gateway routes without an authorizer, unencrypted RDS, public data access (S3, OpenSearch, GCS `allUsers`, Azure blobs), public Cloud Run / Cloud Functions / Lambda URL invokers, and kubernetes provider workloads, RBAC and services. Records carry `for_each`/`count` and local-module provenance in `context`. See the README for the exact rules.
 
 ## Out of scope (for now)
 - Variable interpolation resolution (`${var.foo}`, `aws_iam_role.app.id`) — string literals and direct attribute values are what's extracted.
 - API Gateway v1 path joining (`aws_api_gateway_resource` parent chains) — only individual methods are emitted.
 - Following `policy = data.aws_iam_policy_document.x.json` references — the data source is flagged under its own name instead.
 - `.tfvars.json` files.
-- Module-level recursive analysis — modules are emitted as service hints; their referenced sources aren't followed.
+- Module inputs aren't propagated into the module (e.g. `endpoint_public_access = true` passed to a local module isn't seen by the module's `aws_eks_cluster`). Local modules are attributed to their callers; remote module sources are only checked for pinning.
 - OpenTofu-only resource types not present in the AWS / Azure / GCP providers.
 
 ## HCL parsing approach
