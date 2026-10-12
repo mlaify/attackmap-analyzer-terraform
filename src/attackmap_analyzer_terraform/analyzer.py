@@ -232,11 +232,12 @@ def _top_blocks(pattern: re.Pattern[str], content: str):
             resume = close + 1
 
 
-def _block_body(content: str, body_start: int) -> tuple[str, int]:
+def _block_body(content: str, body_start: int, *, heredocs: bool = True) -> tuple[str, int]:
     """Return the body of a block whose `{` is at body_start-1, plus the offset
     of the closing `}`. Tracks brace depth, string literals, comments and
-    heredocs, so nested `ingress { ... }` blocks are included and a `{` in a
-    comment doesn't count."""
+    (with ``heredocs``) heredocs, so nested `ingress { ... }` blocks are
+    included and a `{` in a comment doesn't count. ``heredocs`` must match
+    the `_scan_text` mode of the caller."""
     depth = 1
     i = body_start
     in_string = False
@@ -251,7 +252,7 @@ def _block_body(content: str, body_start: int) -> tuple[str, int]:
             elif ch == '"':
                 in_string = False
         else:
-            if ch in "#/<":
+            if ch in "#/<" and (heredocs or ch != "<"):
                 skipped = _skip_non_code(content, i)
                 if skipped is not None:
                     i = skipped
@@ -479,7 +480,7 @@ def _json_policy_statements(text: str) -> list[str]:
         # whole body, quadratic in nesting.
         if ch != "{" or in_string[i] or depths[i] > _POLICY_MAX_DEPTH:
             continue
-        inner, _ = _block_body(text, i + 1)
+        inner, _ = _block_body(text, i + 1, heredocs=False)
         if _STATEMENT_KEY_RE.search(_top_level(inner)):
             statements.append(inner)
     return statements

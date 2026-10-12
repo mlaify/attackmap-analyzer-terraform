@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Public S3 ACLs and policies, disabled public-access blocks, public RDS and `NONE` Lambda function URLs (already entrypoint hints) are reported as records too.
 - **Review round 1 fixes (#4).**
   - **Hostile input is linear.** Top-level blocks are scanned on from the end of the previous one, so 30000 unterminated `resource {` take 0.4 s (was >60 s). IAM policy statements are looked for only up to brace depth 8, so 100000 nested `{` take 0.2 s (was >60 s). Signal dedup uses key sets, and line numbers come from a cached per-file index: 40000 modules take 0.8 s (was 52 s) and 20000 records 1.7 s (was 18 s).
+  - **Comments, strings and heredocs** don't count when finding block bounds, and an unterminated block no longer hides later blocks. IAM policy statement scanning uses the same heredoc mode for depth and body scans, so `{ <<EOF\n}\nEOF` repeated inside `jsonencode(` is linear (112 KB took over 60 s).
   - **HTTP listeners.** `aws_lb.x[0].arn` / `["k"]` references resolve. `internal` is looked up per module directory. A `dynamic "default_action"` is judged by its `content`, and a computed action type or `internal` value isn't reported. A listener whose load balancer can't be resolved gets confidence 0.6.
   - **Secret variable defaults** are judged by value too. SSH/PEM public keys, URLs without an embedded password, values under 6 characters, plain words (`UserId`, `master`, `off`) and username-like variables aren't hard-coded secrets.
   - **kubernetes provider.**

@@ -529,8 +529,11 @@ _RUN = "import sys; from attackmap_analyzer_terraform import TerraformAnalyzer; 
         "".join(f'module "m{i}" {{\n  source = "./m"\n}}\n' for i in range(40000)),
         "".join(f'resource "aws_instance" "i{i}" {{\n  associate_public_ip_address = true\n}}\n' for i in range(20000)),
         'resource "kubernetes_pod" "p" {\n' + "  a {\n" * 50000,
+        # Round 3: heredoc mode mismatch between depth scan and body scan.
+        'resource "aws_iam_policy" "p" {\n  policy = jsonencode(' + "{ <<EOF\n}\nEOF\n" * 8000 + ")\n}\n",
     ],
-    ids=["nested-policy", "unterminated-resources", "many-modules", "many-records", "nested-blocks"],
+    ids=["nested-policy", "unterminated-resources", "many-modules", "many-records", "nested-blocks",
+         "heredocs-in-policy"],
 )
 def test_hostile_input_is_fast(tmp_path: Path, text: str) -> None:
     import os
@@ -729,3 +732,12 @@ def test_an_unterminated_block_does_not_hide_later_blocks(tmp_path: Path) -> Non
     records = {(m.kind, m.resource) for m in _records(tmp_path, text)}
     assert ("unencrypted_storage", "aws_db_instance.db") in records
     assert ("public_network_access", "aws_instance.broken") in records
+
+
+def test_heredoc_policy_statements_are_found(tmp_path: Path) -> None:
+    text = (
+        'resource "aws_iam_role_policy" "p" {\n  policy = <<EOF\n'
+        '{"Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}\nEOF\n}\n'
+    )
+    hints = {h.hint for h in _scan(tmp_path, {"main.tf": text}).auth_hints}
+    assert {"iam_wildcard_action:p", "iam_wildcard_resource:p"} <= hints
