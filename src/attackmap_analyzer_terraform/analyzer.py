@@ -48,7 +48,6 @@ from attackmap.sdk import (
     DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
-    CloudMisconfig,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
@@ -61,6 +60,11 @@ from attackmap.sdk import (
     SecretHint,
     ServiceHint,
 )
+
+try:  # cores before 0.6 don't have the record; then no records are emitted
+    from attackmap.sdk import CloudMisconfig
+except ImportError:  # pragma: no cover - exercised against older cores
+    CloudMisconfig = None  # type: ignore[assignment,misc]
 
 
 CODE_SUFFIXES = {".tf", ".tf.json", ".tfvars"}
