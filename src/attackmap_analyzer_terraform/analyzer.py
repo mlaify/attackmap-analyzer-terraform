@@ -44,9 +44,8 @@ from pathlib import Path
 
 from bisect import bisect_right
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
     CloudMisconfig,
@@ -54,11 +53,15 @@ from .contracts import (
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
 
 CODE_SUFFIXES = {".tf", ".tf.json", ".tfvars"}
 # Terraform's provider/module cache on top of the shared skip list (which
