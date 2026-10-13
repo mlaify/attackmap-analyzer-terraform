@@ -44,21 +44,28 @@ from pathlib import Path
 
 from bisect import bisect_right
 
-from attackmap.sdk import DEFAULT_SKIP_DIRS, iter_repo_files, read_source, rel
-
-from .contracts import (
+from attackmap.sdk import (
+    DEFAULT_SKIP_DIRS,
     AnalyzerMetadata,
     AuthHint,
-    CloudMisconfig,
     DatabaseHint,
     EntrypointHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
     ServiceHint,
 )
+
+try:  # cores before 0.6 don't have the record; then no records are emitted
+    from attackmap.sdk import CloudMisconfig
+except ImportError:  # pragma: no cover - exercised against older cores
+    CloudMisconfig = None  # type: ignore[assignment,misc]
+
 
 CODE_SUFFIXES = {".tf", ".tf.json", ".tfvars"}
 # Terraform's provider/module cache on top of the shared skip list (which
