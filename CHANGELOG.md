@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Added
 
 - **Misconfigurations become core findings (#4, AttackMap#334).** Risky settings are emitted as `CloudMisconfig` records in `cloud_misconfigs`, which core turns into findings with CWE/OWASP/ATT&CK ids. Existing entrypoint/auth hints are unchanged. New and newly reported checks:
@@ -67,5 +74,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-terraform/releases/tag/v0.1.0

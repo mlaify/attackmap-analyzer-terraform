@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-terraform"
-version = "0.1.0"
+version = "0.2.0"
 description = "Terraform / HCL infrastructure-as-code analyzer plugin for AttackMap (AWS, Azure, GCP resources; IAM wildcards; open security groups; secret resources)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -46,12 +46,12 @@ dependencies = [
 
 [project.optional-dependencies]
 core = [
-  "attackmap @ git+https://github.com/mlaify/AttackMap.git",
+  "attackmap>=0.6.0",
 ]
 dev = [
   "pytest>=8.0.0",
   "build>=1.2.0",
-  "attackmap @ git+https://github.com/mlaify/AttackMap.git",
+  "attackmap>=0.6.0",
 ]
 
 [project.urls]
