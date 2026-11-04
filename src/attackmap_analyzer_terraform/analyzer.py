@@ -324,10 +324,41 @@ def _scan_text(text: str, *, heredocs: bool = True) -> tuple[list[int], list[boo
     return depths, in_string
 
 
+def _blank_comments(text: str) -> str:
+    """``text`` with every ``#``, ``//`` and ``/* */`` comment replaced by
+    spaces (newlines kept, so offsets and line numbers don't move). Strings
+    (``"a#b"``) and heredoc bodies are left as they are. Attribute lookups
+    read a value up to the end of its line, so ``x = true  # note`` would
+    otherwise read as ``true  # note``."""
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            j = i + 1
+            while j < n and text[j] not in '"\n':
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch in "#/<":
+            end = _skip_non_code(text, i)
+            if end is not None:
+                if ch != "<":  # a comment; heredocs are kept
+                    for k in range(i, end):
+                        if out[k] != "\n":
+                            out[k] = " "
+                i = end
+                continue
+        i += 1
+    return "".join(out)
+
+
 def _top_level(body: str) -> str:
     """``body`` with the contents of every nested ``{ ... }`` removed (the
     braces themselves are kept), so attribute lookups only see the block's own
-    attributes and not those of nested blocks or object values."""
+    attributes and not those of nested blocks or object values. Comments are
+    blanked (``_blank_comments``)."""
+    body = _blank_comments(body)
     depths, _ = _scan_text(body)
     return "".join(ch for ch, d in zip(body, depths) if d == 0)
 
@@ -779,7 +810,9 @@ def _instancing(body: str) -> str | None:
 def _top_level_with_values(body: str) -> str:
     """``body`` without its nested *blocks* (``name {`` / ``dynamic "x" {``)
     but keeping ``attr = { ... }`` object values, so a ``for_each = {...}``
-    is read whole while a nested block's own ``count`` is not."""
+    is read whole while a nested block's own ``count`` is not. Comments are
+    blanked (``_blank_comments``)."""
+    body = _blank_comments(body)
     depths, in_string = _scan_text(body)
     keep = [True] * len(body)
     for match in _NESTED_BLOCK_RE.finditer(body):
