@@ -1022,7 +1022,7 @@ class TerraformAnalyzer:
     metadata = AnalyzerMetadata(
         name="terraform",
         display_name="Terraform / HCL Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Terraform infrastructure-as-code analyzer covering AWS, Azure, and GCP resources, IAM wildcards, open security groups, and secrets.",
         scope="Terraform / OpenTofu projects (.tf files). Detects provider-level resources, public ingress, secret resources, and database engines.",
         targets=["terraform", "iac", "hcl", "aws", "azure", "gcp"],

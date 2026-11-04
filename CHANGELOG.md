@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-31
+
+### Changed — packaging
+
+- Released to the mlaify package index (https://pkg.mlaify.io/pypi/simple/). A `v*` tag now builds the wheel and sdist and attaches them to a GitHub release (`.github/workflows/release.yml`); the index picks them up within six hours.
+- The `core` and `dev` extras require `attackmap>=0.6.0` from the index instead of AttackMap's git main.
+
 ### Fixed
 
 - **Trailing comments no longer hide a setting.** An attribute followed by a `#`, `//` or `/* */` comment on its line (`publicly_accessible = true  # legacy`) was read with the comment attached, so every check that tests a value missed it: public RDS, unencrypted storage, public EKS endpoints, `NONE` Lambda URLs and API Gateway methods, unpinned modules, and the rest. Comments are now blanked before attribute lookups; strings (`"a#b"`) and heredoc bodies are unchanged, and a setting that only appears inside a comment still doesn't count.
@@ -71,5 +78,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Emits Signal-v2 records (`file:line` citation, evidence text, and confidence
   score) for every signal.
 
-[Unreleased]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/mlaify/attackmap-analyzer-terraform/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mlaify/attackmap-analyzer-terraform/releases/tag/v0.1.0
