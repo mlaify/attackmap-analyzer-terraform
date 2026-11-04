@@ -741,3 +741,64 @@ def test_heredoc_policy_statements_are_found(tmp_path: Path) -> None:
     )
     hints = {h.hint for h in _scan(tmp_path, {"main.tf": text}).auth_hints}
     assert {"iam_wildcard_action:p", "iam_wildcard_resource:p"} <= hints
+
+
+# ---------- Trailing comments ----------
+
+_COMMENTED = """
+resource "aws_db_instance" "main" {
+  engine              = "postgres"
+  publicly_accessible = true
+  storage_encrypted   = false
+}
+
+resource "aws_lambda_function_url" "open" {
+  function_name      = "fn"
+  authorization_type = "NONE"
+}
+
+resource "aws_eks_cluster" "k" {
+  name = "k"
+  vpc_config {
+    endpoint_public_access = true
+  }
+}
+
+module "vpc" {
+  source = "github.com/example/terraform-aws-vpc"
+}
+"""
+
+
+def _kinds(records):
+    return sorted((m.kind, m.resource, m.severity, m.line) for m in records)
+
+
+@pytest.mark.parametrize("comment", ["# note", "// note", "/* note */"])
+def test_trailing_comments_do_not_hide_settings(tmp_path: Path, comment: str) -> None:
+    plain = _records(tmp_path / "plain", _COMMENTED)
+    assert len(plain) == 5
+    commented = "\n".join(
+        line + "   " + comment if "=" in line else line for line in _COMMENTED.splitlines()
+    )
+    assert _kinds(_records(tmp_path / "commented", commented)) == _kinds(plain)
+
+
+def test_settings_only_in_comments_are_ignored(tmp_path: Path) -> None:
+    text = """
+resource "aws_db_instance" "main" {
+  engine = "postgres"
+  # publicly_accessible = true
+  storage_encrypted = true // was: storage_encrypted = false
+  /* endpoint_public_access = true */
+}
+"""
+    assert _records(tmp_path, text) == []
+
+
+def test_hash_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
+    text = 'module "m" {\n  source = "git::https://example.com/vpc.git?ref=v1.2.0#frag"\n}\n'
+    plain = 'module "m" {\n  source = "git::https://example.com/vpc.git?ref=v1.2.0"\n}\n'
+    assert _kinds(_records(tmp_path / "a", text, "iac_module_unpinned")) == _kinds(
+        _records(tmp_path / "b", plain, "iac_module_unpinned")
+    )

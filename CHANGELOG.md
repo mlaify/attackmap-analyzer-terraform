@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Trailing comments no longer hide a setting.** An attribute followed by a `#`, `//` or `/* */` comment on its line (`publicly_accessible = true  # legacy`) was read with the comment attached, so every check that tests a value missed it: public RDS, unencrypted storage, public EKS endpoints, `NONE` Lambda URLs and API Gateway methods, unpinned modules, and the rest. Comments are now blanked before attribute lookups; strings (`"a#b"`) and heredoc bodies are unchanged, and a setting that only appears inside a comment still doesn't count.
+
 ### Added
 
 - **Misconfigurations become core findings (#4, AttackMap#334).** Risky settings are emitted as `CloudMisconfig` records in `cloud_misconfigs`, which core turns into findings with CWE/OWASP/ATT&CK ids. Existing entrypoint/auth hints are unchanged. New and newly reported checks:
