@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-14
+
 ### Changed — packaging
 - Depends on `attackmap>=0.6.0,<1.0.0` (it was only in the `core` extra), so `pip install attackmap-analyzer-terraform`
   installs a working analyzer on its own. The `core` extra stays for existing installs.

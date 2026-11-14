@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "attackmap-analyzer-terraform"
-version = "0.2.1"
+version = "0.2.2"
 description = "Terraform / HCL infrastructure-as-code analyzer plugin for AttackMap (AWS, Azure, GCP resources; IAM wildcards; open security groups; secret resources)."
 readme = "README.md"
 requires-python = ">=3.11"
