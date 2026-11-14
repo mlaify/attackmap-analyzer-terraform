@@ -7,8 +7,8 @@ submit changes.
 ## Code of Conduct
 
 This project adheres to the [Code of Conduct](CODE_OF_CONDUCT.md). By
-participating, you agree to uphold it. Report unacceptable behavior to
-[mlaify@mlaify.io](mailto:mlaify@mlaify.io).
+participating, you agree to uphold it. Report unacceptable behavior privately through
+this repository's **Security** tab.
 
 ## Getting started
 
@@ -68,8 +68,8 @@ evidence-text snippet, and a confidence score. See the AttackMap SDK at
 
 ## Reporting security issues
 
-Please do **not** open public issues for security vulnerabilities. Email
-[mlaify@mlaify.io](mailto:mlaify@mlaify.io) — see
+Please do **not** open public issues for security vulnerabilities. Use this
+repository's **Security** tab and select **Report a vulnerability** — see
 [SECURITY.md](SECURITY.md) for the full disclosure policy.
 
 ## License
