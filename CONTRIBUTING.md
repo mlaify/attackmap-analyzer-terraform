@@ -7,8 +7,8 @@ submit changes.
 ## Code of Conduct
 
 This project adheres to the [Code of Conduct](CODE_OF_CONDUCT.md). By
-participating, you agree to uphold it. Report unacceptable behavior privately through
-this repository's **Security** tab.
+participating, you agree to uphold it. Report unacceptable behavior privately with GitHub's
+**Report content** option (choose **Report to repository admins**).
 
 ## Getting started
 
