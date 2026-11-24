@@ -37,6 +37,7 @@ attribute values are what we extract.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import posixpath
 import re
@@ -62,9 +63,11 @@ from attackmap.sdk import (
 )
 
 try:  # cores before 0.6 don't have the record; then no records are emitted
+    from attackmap.models import CLOUD_MISCONFIG_KINDS
     from attackmap.sdk import CloudMisconfig
 except ImportError:  # pragma: no cover - exercised against older cores
     CloudMisconfig = None  # type: ignore[assignment,misc]
+    CLOUD_MISCONFIG_KINDS = ()
 
 
 CODE_SUFFIXES = {".tf", ".tf.json", ".tfvars"}
@@ -528,14 +531,41 @@ def _statement_is_deny(effect: str | None) -> bool:
     return (effect or "").strip().strip('"').lower() == "deny"
 
 
+# IAM-write actions that let a principal grant itself more access (#370).
+_ESCALATION_ACTIONS = (
+    "iam:createpolicyversion", "iam:setdefaultpolicyversion",
+    "iam:attachuserpolicy", "iam:attachrolepolicy", "iam:attachgrouppolicy",
+    "iam:putuserpolicy", "iam:putrolepolicy", "iam:putgrouppolicy",
+    "iam:createaccesskey", "iam:createloginprofile", "iam:updateloginprofile",
+    "iam:updateassumerolepolicy", "iam:addusertogroup", "iam:passrole",
+)
+
+
+def _escalation_actions(actions: str | None, resources: str | None) -> list[str]:
+    """Escalation actions an Allow statement grants. Patterns (`iam:Attach*`,
+    `*`) expand; the statement's resources must be `*` or IAM ARNs (PassRole:
+    `*` only), so `s3:*` or `*` on a bucket doesn't count."""
+    if not actions or not resources:
+        return []
+    any_resource = _has_wildcard(resources)
+    if not (any_resource or ":iam::" in resources or "aws_iam_" in resources):
+        return []
+    patterns = [a.lower() for a in re.findall(r'"([^"]+)"', actions)]
+    return [
+        action for action in _ESCALATION_ACTIONS
+        if (action != "iam:passrole" or any_resource) and any(fnmatch.fnmatchcase(action, p) for p in patterns)
+    ]
+
+
 class _PolicyFindings:
-    __slots__ = ("wildcard_action", "wildcard_resource", "public_principal")
+    __slots__ = ("escalation", "public_principal", "wildcard_action", "wildcard_resource")
 
     def __init__(self) -> None:
         self.wildcard_action = False
         self.wildcard_resource = False
         # Allow + Principal "*" with no Condition: anyone can use it.
         self.public_principal = False
+        self.escalation: set[str] = set()
 
 
 def _scan_json_policies(text: str) -> _PolicyFindings:
@@ -543,6 +573,9 @@ def _scan_json_policies(text: str) -> _PolicyFindings:
     for statement in _json_policy_statements(text):
         if _statement_is_deny(_attr_value(statement, "Effect")):
             continue
+        findings.escalation.update(
+            _escalation_actions(_attr_value(statement, "Action"), _attr_value(statement, "Resource"))
+        )
         if _has_wildcard(_attr_value(statement, "Action")):
             findings.wildcard_action = True
         if _has_wildcard(_attr_value(statement, "Resource")):
@@ -559,6 +592,7 @@ def _scan_policy_document(body: str) -> _PolicyFindings:
         if _statement_is_deny(_extract_attr(statement, "effect")):
             continue
         top = _top_level(statement)
+        findings.escalation.update(_escalation_actions(_attr_value(top, "actions"), _attr_value(top, "resources")))
         if _has_wildcard(_attr_value(top, "actions")):
             findings.wildcard_action = True
         if _has_wildcard(_attr_value(top, "resources")):
@@ -1358,11 +1392,22 @@ class TerraformAnalyzer:
             self._append_unique_secret(result, f"data:{data_type}:{data_name}", file, line, ev)
             return
         if data_type == "aws_iam_policy_document":
-            self._emit_policy_findings(_scan_policy_document(body), data_name, file, line, ev, result)
+            self._emit_policy_findings(
+                _scan_policy_document(body), data_name, file, line, ev, result, f"data.{data_type}.{data_name}",
+            )
 
     def _emit_policy_findings(
         self, findings: _PolicyFindings, name: str, file: str, line: int, ev: str, result: ScanResult,
+        resource: str,
     ) -> None:
+        if findings.escalation:
+            actions = sorted(findings.escalation)
+            self._append_misconfig(
+                result, "iam_privilege_escalation", resource, "aws", file, line,
+                "allows " + ", ".join(actions[:4]) + (f" (+{len(actions) - 4} more)" if len(actions) > 4 else ""),
+                severity="high", confidence=0.8,
+                escalation="a principal holding this policy can grant itself administrator access",
+            )
         if findings.wildcard_action:
             self._append_unique_auth(result, f"iam_wildcard_action:{name}", file, line, ev, 0.7)
         if findings.wildcard_resource:
@@ -1594,7 +1639,9 @@ class TerraformAnalyzer:
         if resource_type in _IAM_POLICY_RESOURCES:
             # Identity policies (Action/Resource) and, for aws_iam_role, the
             # assume_role_policy trust document (Principal) plus inline_policy.
-            self._emit_policy_findings(_scan_json_policies(body), resource_name, file, line, ev, result)
+            self._emit_policy_findings(
+                _scan_json_policies(body), resource_name, file, line, ev, result, f"{resource_type}.{resource_name}",
+            )
             return
 
         # ---- Azure ----
@@ -1668,6 +1715,8 @@ class TerraformAnalyzer:
             self._append_misconfig(result, kind, resource, platform, file, where, evidence, **kw)  # type: ignore[arg-type]
 
         # ---- AWS ----
+        if resource_type in {"aws_instance", "aws_launch_configuration", "aws_launch_template"}:
+            self._check_imds(body, emit)
         if resource_type in {"aws_instance", "aws_launch_configuration"}:
             if _is_true(body, "associate_public_ip_address"):
                 emit(
@@ -1791,6 +1840,21 @@ class TerraformAnalyzer:
                         severity="low", confidence=0.7,
                         escalation="the service is reachable from outside the cluster by any source address",
                     )
+
+    @staticmethod
+    def _check_imds(body: str, emit) -> None:  # type: ignore[no-untyped-def]
+        """IMDSv1 (#241): an explicit `http_tokens = "optional"`. An unset
+        value follows the AMI and account default, which may require IMDSv2,
+        so it isn't reported."""
+        for options in _sub_blocks(body, "metadata_options"):
+            if (_extract_attr(options, "http_endpoint") or "").lower() == "disabled":
+                return
+            if (_extract_attr(options, "http_tokens") or "").lower() == "optional":
+                emit(
+                    "imds_v1_enabled", "http_tokens", 'http_tokens = "optional"', severity="medium", confidence=0.9,
+                    escalation="an SSRF on the instance can read its role credentials from 169.254.169.254",
+                )
+                return
 
     @staticmethod
     def _check_eks_endpoint(body: str, emit) -> None:  # type: ignore[no-untyped-def]
@@ -1975,8 +2039,8 @@ class TerraformAnalyzer:
     ) -> None:
         """One `CloudMisconfig` per (kind, file, line, resource). ``context``
         defaults to the dispatched resource's for_each/count and module."""
-        if not _CLOUD_RECORDS:
-            return  # AttackMap core older than the CloudMisconfig contract
+        if not _CLOUD_RECORDS or kind not in CLOUD_MISCONFIG_KINDS:
+            return  # AttackMap core older than the CloudMisconfig contract or this kind
         if not _first_seen(result, ("misconfig", kind, file, line, resource, evidence)):
             return
         result.cloud_misconfigs.append(
