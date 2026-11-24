@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `imds_v1_enabled` (AttackMap#241): `aws_instance`, `aws_launch_template` and `aws_launch_configuration` with
+  `metadata_options { http_tokens = "optional" }`. An unset value follows the AMI and account default and isn't reported.
+- `iam_privilege_escalation` (AttackMap#370): IAM policies (`aws_iam_*` policy resources and `aws_iam_policy_document`)
+  whose Allow statements grant IAM-write actions (`iam:CreatePolicyVersion`, `iam:Attach*Policy`, `iam:Put*Policy`,
+  `iam:CreateAccessKey`, ..., or `iam:*` / `*`) on `*` or IAM ARNs, or `iam:PassRole` on `*`.
+- Both kinds are emitted only when the installed AttackMap core knows them (0.7.0+).
+
 ## [0.2.2] - 2026-11-14
 
 ### Changed — packaging

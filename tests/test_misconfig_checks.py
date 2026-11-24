@@ -802,3 +802,50 @@ def test_hash_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
     assert _kinds(_records(tmp_path / "a", text, "iac_module_unpinned")) == _kinds(
         _records(tmp_path / "b", plain, "iac_module_unpinned")
     )
+
+
+# ---------- IMDSv1 and IAM privilege escalation (#241, #370) ----------
+
+
+def test_imds_v1_on_instances_and_launch_templates(tmp_path: Path) -> None:
+    records = _records(
+        tmp_path,
+        'resource "aws_instance" "v1" {\n  metadata_options {\n    http_tokens = "optional"\n  }\n}\n'
+        'resource "aws_instance" "unset" {\n  ami = "ami-1"\n}\n'
+        'resource "aws_instance" "v2" {\n  metadata_options {\n    http_tokens = "required"\n  }\n}\n'
+        'resource "aws_instance" "off" {\n  metadata_options {\n    http_endpoint = "disabled"\n  }\n}\n'
+        'resource "aws_instance" "computed" {\n  metadata_options {\n    http_tokens = var.tokens\n  }\n}\n'
+        'resource "aws_launch_template" "lt" {\n  metadata_options {\n    http_tokens = "optional"\n  }\n}\n',
+        "imds_v1_enabled",
+    )
+    got = {(r.resource, r.severity, r.line) for r in records}
+    assert got == {
+        ("aws_instance.v1", "medium", 3),
+        ("aws_launch_template.lt", "medium", 26),
+    }
+
+
+def test_iam_privilege_escalation_in_policies(tmp_path: Path) -> None:
+    records = _records(
+        tmp_path,
+        'resource "aws_iam_policy" "ci" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Allow"\n      Action = ["iam:CreatePolicyVersion", "s3:GetObject"]\n      Resource = "*"\n    }]\n  })\n}\n'
+        'resource "aws_iam_role_policy" "pass" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Allow"\n      Action = "iam:PassRole"\n      Resource = "*"\n    }]\n  })\n}\n'
+        'data "aws_iam_policy_document" "attach" {\n  statement {\n'
+        '    actions   = ["iam:Attach*"]\n    resources = ["arn:aws:iam::123456789012:user/*"]\n  }\n}\n'
+        # Not escalation: PassRole scoped to one role, `*` on one bucket, a Deny.
+        'resource "aws_iam_policy" "scoped" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Allow"\n      Action = "iam:PassRole"\n      Resource = "arn:aws:iam::123456789012:role/app"\n    }]\n  })\n}\n'
+        'resource "aws_iam_policy" "bucket" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Allow"\n      Action = "*"\n      Resource = "arn:aws:s3:::logs/*"\n    }]\n  })\n}\n'
+        'resource "aws_iam_policy" "deny" {\n  policy = jsonencode({\n    Statement = [{\n'
+        '      Effect = "Deny"\n      Action = "iam:*"\n      Resource = "*"\n    }]\n  })\n}\n',
+        "iam_privilege_escalation",
+    )
+    by_resource = {r.resource: r for r in records}
+    assert set(by_resource) == {
+        "aws_iam_policy.ci", "aws_iam_role_policy.pass", "data.aws_iam_policy_document.attach",
+    }
+    assert by_resource["aws_iam_policy.ci"].evidence_text == "allows iam:createpolicyversion"
+    assert all(r.severity == "high" and r.platform == "aws" for r in records)
