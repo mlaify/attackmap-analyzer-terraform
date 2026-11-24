@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
 ### Added
 - `imds_v1_enabled` (AttackMap#241): `aws_instance`, `aws_launch_template` and `aws_launch_configuration` with
   `metadata_options { http_tokens = "optional" }`. An unset value follows the AMI and account default and isn't reported.
