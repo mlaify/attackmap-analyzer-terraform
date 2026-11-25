@@ -6,56 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  test:
-    name: pytest
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.12", "3.13"]
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-
-      - name: Install attackmap core from main
-        run: |
-          python -m pip install --upgrade pip
-          pip install "attackmap @ git+https://github.com/mlaify/AttackMap@main"
-
-      - name: Install package
-        run: pip install -e ".[dev]"
-
-      - name: Run tests
-        run: pytest -q
-
-  build:
-    name: Build sdist + wheel
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Build distributions
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-          retention-days: 7
+  ci:
+    # Tests against the oldest core this plugin declares, the latest release and
+    # AttackMap main, then builds sdist + wheel (mlaify/AttackMap#254).
+    uses: mlaify/AttackMap/.github/workflows/plugin-ci.yml@main
+    with:
+      min-core: "0.8.0"
