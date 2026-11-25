@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- SDK 1.0 (mlaify/AttackMap#254, #384): depends on `attackmap>=0.8,<2`; `metadata.requires_core` states the same
+  range, so core skips the analyzer with an upgrade hint on a mismatched core; `metadata.version` comes from the
+  installed distribution; `tests/test_sdk_conformance.py` runs `attackmap.sdk.testing.assert_conforms`.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added
