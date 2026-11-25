@@ -1057,7 +1057,7 @@ class TerraformAnalyzer:
     metadata = AnalyzerMetadata(
         name="terraform",
         display_name="Terraform / HCL Analyzer",
-        version=plugin_version("attackmap-analyzer-terraform", default="0.3.0"),
+        version=plugin_version("attackmap-analyzer-terraform", default="0.4.0"),
         requires_core=">=0.8,<2",
         description="Terraform infrastructure-as-code analyzer covering AWS, Azure, and GCP resources, IAM wildcards, open security groups, and secrets.",
         scope="Terraform / OpenTofu projects (.tf files). Detects provider-level resources, public ingress, secret resources, and database engines.",
